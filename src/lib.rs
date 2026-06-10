@@ -4,10 +4,6 @@ use crate::nodebuilder::{NodeBuilder, NodeView, Path, Root, RuleBuilder};
 
 pub mod nodebuilder;
 
-struct Accumulator {
-    pub value: f32
-}
-
 fn test() {
 
     let parent_mapper = |view: &NodeView, ctx: &mut HashMap<String, String>| {
@@ -15,7 +11,7 @@ fn test() {
     };
 
     let rule_builder = RuleBuilder::test(Arc::new(|view, ctx| {
-                view.attr("UUID").map_or(false, |&id| {id == "un id".into()})
+                view.attr("UUID").map_or(false, |id| {id.eq("un id")})
             }))
             .fold(Arc::new(|acc, curr| {
                 acc || curr

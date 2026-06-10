@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use futures::{Stream, StreamExt};
 
@@ -17,11 +17,8 @@ pub trait NodeBuilder<'a> {
     fn build(self) -> Self::BuildOutput;
 }
 
-struct ChildBuilder;
-struct RootBuilder;
-
-struct InitState;
-struct NodeAdderState;
+pub struct InitState;
+pub struct NodeAdderState;
 
 pub struct Root<'a, State> {
     _state: std::marker::PhantomData<State>,
@@ -115,19 +112,6 @@ impl <'a, P: NodeHandler<'a>> NodeHandler<'a> for Child<'a, NodeAdderState, P> {
     }
 }
 
-impl <'a, P: NodeHandler<'a>> Child<'a, NodeAdderState, P> {
-    fn to_builder(self) -> Child<'a, InitState, P> {
-        Child {
-            _state: std::marker::PhantomData,
-            nodes: self.nodes,
-            map_from_parent: self.map_from_parent,
-            parent: self.parent,
-            path: self.path,
-            rules: self.rules,
-        }
-    }
-}
-
 impl <'a, P: NodeHandler<'a>> NodeBuilder<'a> for Child<'a, InitState, P> {
     type AddRuleOutput = Child<'a, InitState, P>;
 
@@ -200,41 +184,90 @@ impl <'a> Node<'a> {
             nodes
         }
     }
+    
+    pub fn rules(&self) -> &Vec<Rule> {
+        &self.rules
+    }
+
+    pub fn children(&self) -> &HashMap<Path, (Node<'a>, Option<&'a ParentPropertyMapper<'a>>)> {
+        &self.nodes
+    }
+
+    pub async fn run(&self, stream: Pin<Box<dyn Stream<Item = NodeView>>>, ctx: &HashMap<String, String>) -> Vec<RuleResult> {
+
+            while let Some(view) = stream.next().await {
+                for rule in self.rules {
+                    
+                }
+                acc = fold(acc, test(&view, ctx))
+            }
+            assert(&acc)
+        }
+        let test = Arc::clone(&self.test);
+        let fold = Arc::clone(&self.fold);
+        let assert = Arc::clone(&self.assert);
+        let init = Arc::clone(&self.init);
+        Rule {
+            assertion: assertion.into(),
+            test_fold_assert: Box::new(
+                move |mut stream, ctx| {
+                        let mut acc = (init)();
+                        let test = Arc::clone(&test);
+                        let fold = Arc::clone(&fold);
+                        let assert = Arc::clone(&assert);
+                    Box::pin(async move {
+                        while let Some(view) = stream.next().await {
+                            acc = fold(acc, test(&view, ctx))
+                        }
+                        assert(&acc)
+                    })
+                }
+            )
+        }
+    }
 }
 
-struct NoTest;
-struct NoFold;
-struct NoInit;
-struct NoAssert;
+pub struct RuleResult(Path, bool, String);
+
+pub struct NoTest;
+pub struct NoFold;
+pub struct NoInit;
+pub struct NoAssert;
+pub struct NoAssertion;
 
 pub struct RuleBuilder<
     TestType,
     FoldType,
     InitType,
-    AssertType
+    AssertType,
+    AssertionType
 > {
     test: TestType,
     fold: FoldType,
     init: InitType,
     assert: AssertType,
+    assertion: NoAssertion
 }
 impl RuleBuilder<
     NoTest,
     NoFold,
     NoInit,
-    NoAssert
+    NoAssert,
+    NoAssertion
 > {
     pub fn test<R>(test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R>) -> RuleBuilder<
         Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R>,
         NoFold,
         NoInit,
-        NoAssert
+        NoAssert,
+        NoAssertion
     > {
         RuleBuilder {
             test: test,
             fold: NoFold,
             init: NoInit,
-            assert: NoAssert
+            assert: NoAssert,
+            assertion: NoAssertion
         }
     }
 }
@@ -243,19 +276,22 @@ impl <R: 'static> RuleBuilder<
     Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R>,
     NoFold,
     NoInit,
-    NoAssert
+    NoAssert,
+    NoAssertion
 > {
     pub fn fold<Acc>(self, fold: Arc<dyn Fn(Acc, R) -> Acc>) -> RuleBuilder<
         Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R>,
         Arc<dyn Fn(Acc, R) -> Acc>,
         NoInit,
-        NoAssert
+        NoAssert,
+        NoAssertion
     > {
         RuleBuilder {
             test: self.test,
             fold: fold,
             init: NoInit,
-            assert: NoAssert
+            assert: NoAssert,
+            assertion: NoAssertion
         }
     }
 }
@@ -264,19 +300,22 @@ impl <R: 'static, Acc: 'static> RuleBuilder<
     Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R>,
     Arc<dyn Fn(Acc, R) -> Acc>,
     NoInit,
-    NoAssert
+    NoAssert,
+    NoAssertion
 > {
     pub fn init(self, init: Arc<dyn Fn() -> Acc>) -> RuleBuilder<
         Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R>,
         Arc<dyn Fn(Acc, R) -> Acc>,
         Arc<dyn Fn() -> Acc>,
-        NoAssert
+        NoAssert,
+        NoAssertion
     > {
         RuleBuilder {
             test: self.test,
             fold: self.fold,
             init: init,
-            assert: NoAssert
+            assert: NoAssert,
+            assertion: NoAssertion
         }
     }
 }
@@ -297,7 +336,8 @@ impl <R: 'static, Acc: 'static> RuleBuilder<
             test: self.test,
             fold: self.fold,
             init: self.init,
-            assert: assert
+            assert: assert,
+            assertion: NoAssertion
         }
     }
 }
@@ -306,26 +346,27 @@ impl <R: 'static, Acc: 'static> RuleBuilder<
     Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R>,
     Arc<dyn Fn(Acc, R) -> Acc>,
     Arc<dyn Fn() -> Acc>,
-    Arc<dyn Fn(&Acc) -> bool>
+    Arc<dyn Fn(&Acc) -> bool>,
+    String
 > {
     pub fn build(&self, assertion: &str) -> Rule {
-        let cloned_test = Arc::clone(&self.test);
-        let cloned_fold = Arc::clone(&self.fold);
-        let cloned_assert = Arc::clone(&self.assert);
-        let cloned_init = Arc::clone(&self.init);
+        let test = Arc::clone(&self.test);
+        let fold = Arc::clone(&self.fold);
+        let assert = Arc::clone(&self.assert);
+        let init = Arc::clone(&self.init);
         Rule {
             assertion: assertion.into(),
             test_fold_assert: Box::new(
                 move |mut stream, ctx| {
-                        let mut init = cloned_init();
-                        let cloned_test = Arc::clone(&cloned_test);
-                        let cloned_fold = Arc::clone(&cloned_fold);
-                        let cloned_assert = Arc::clone(&cloned_assert);
+                        let mut acc = (init)();
+                        let test = Arc::clone(&test);
+                        let fold = Arc::clone(&fold);
+                        let assert = Arc::clone(&assert);
                     Box::pin(async move {
                         while let Some(view) = stream.next().await {
-                            init = cloned_fold(init, cloned_test(&view, ctx))
+                            acc = fold(acc, test(&view, ctx))
                         }
-                        cloned_assert(&init)
+                        assert(&acc)
                     })
                 }
             )
@@ -333,9 +374,23 @@ impl <R: 'static, Acc: 'static> RuleBuilder<
     }
 }
 
+
+
 pub struct Rule {
     test_fold_assert: Box<dyn for<'a> Fn(Pin<Box<dyn Stream<Item = NodeView> + 'a>>, &'a HashMap<String, String>) -> Pin<Box<dyn Future<Output = bool> + 'a>>>,
     assertion: String
+}
+
+impl Rule {
+    pub fn test<E>(&self, view: NodeView) -> E {
+        self.test(view)
+    }
+    pub fn apply<'a>(&self, stream: Pin<Box<dyn Stream<Item = NodeView>>>, ctx: &'a HashMap<String, String>) ->Pin<Box<dyn futures::Future<Output = bool> + 'a>> {
+        (self.test_fold_assert)(stream, ctx)
+    }
+    pub fn assertion(&self) -> &String {
+        &self.assertion
+    }
 }
 
 pub struct NodeView {
