@@ -219,13 +219,18 @@ impl <'a> Node<'a> {
         self.parent = Rc::downgrade(parent)
     }
 
-    pub fn path(&self) -> &String {
-        &self.path.0
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn rules(self) -> Vec<Box<dyn Rule>> {
+        self.rules
     }
 
     pub fn children(&self) -> &HashMap<Path, (Rc<RefCell<Node<'a>>>, Option<&'a ParentPropertyMapper<'a>>)> {
         &self.nodes
     }
+
     pub fn parent(&self) -> &Weak<RefCell<Node<'a>>> {
         &self.parent
     }
