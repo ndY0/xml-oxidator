@@ -1,6 +1,5 @@
-use std::{cell::RefCell, collections::HashMap, pin::Pin, rc::{Rc, Weak}, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::{Rc, Weak}, sync::Arc};
 
-use futures::{Stream, StreamExt};
 
 pub trait NodeHandler<'a> {
     type ToBuilderOuput;
@@ -17,9 +16,30 @@ pub trait NodeBuilder<'a> {
     fn build(self) -> Self::BuildOutput;
 }
 
-pub trait Rule: Send {
+pub trait Rule
+    where Self: Send + DynCloneRule 
+{
     fn fold(&mut self, view: &NodeView, ctx: &HashMap<String, String>);
     fn assert(&self) -> Diagnostic;
+}
+
+// intermediate trait, necessary for the blanket impl
+pub trait DynCloneRule {
+    fn clone_box(&self) -> Box<dyn Rule>;
+}
+
+// blanket impl of the intermediate trait
+// it is important to restrict to Clone
+impl<T: Rule + Clone + 'static> DynCloneRule for T {
+    fn clone_box(&self) -> Box<dyn Rule> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn Rule> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
 }
 
 pub struct InitState;
@@ -223,8 +243,8 @@ impl <'a> Node<'a> {
         &self.path
     }
 
-    pub fn rules(self) -> Vec<Box<dyn Rule>> {
-        self.rules
+    pub fn rules(&self) -> Vec<Box<dyn Rule>> {
+        self.rules.clone()
     }
 
     pub fn children(&self) -> &HashMap<Path, (Rc<RefCell<Node<'a>>>, Option<&'a ParentPropertyMapper<'a>>)> {
@@ -234,22 +254,9 @@ impl <'a> Node<'a> {
     pub fn parent(&self) -> &Weak<RefCell<Node<'a>>> {
         &self.parent
     }
-    pub async fn run(&mut self, mut stream: Pin<Box<dyn Stream<Item = NodeView>>>, ctx: &HashMap<String, String>) -> Vec<RuleResult> {
-
-            while let Some(view) = stream.next().await {
-                for rule in self.rules.iter_mut() {
-                    rule.fold(&view, ctx);
-                }
-            }
-            self.rules.iter()
-            .map(|rule| {
-                let diagnostic = rule.assert();
-                RuleResult(self.path.clone(), diagnostic.statut, diagnostic.assertion)
-            }).collect()
-        }
 }
 
-pub struct RuleResult(pub Path, pub bool, pub String);
+pub struct RuleResult(pub String, pub bool, pub String);
 
 pub struct NoTest;
 pub struct NoFold;
@@ -288,12 +295,15 @@ impl RuleBuilder<
     }
 }
 
-impl <R: 'static> RuleBuilder<
+impl <R> RuleBuilder<
     Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
     NoFold,
     NoInit,
     NoAssert,
-> {
+>
+where
+    R: Clone + 'static
+{
     pub fn fold<Acc: Send + 'static>(self, fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>) -> RuleBuilder<
         Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
@@ -309,12 +319,16 @@ impl <R: 'static> RuleBuilder<
     }
 }
 
-impl <R: 'static, Acc: Send + 'static> RuleBuilder<
+impl <R, Acc> RuleBuilder<
     Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
     Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
     NoInit,
     NoAssert,
-> {
+>
+where
+    Acc: Send + Clone + 'static,
+    R: Clone + 'static
+{
     pub fn init(self, init: Box<dyn Fn() -> Acc>) -> RuleBuilder<
         Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
@@ -330,12 +344,16 @@ impl <R: 'static, Acc: Send + 'static> RuleBuilder<
     }
 }
 
-impl <R: 'static, Acc: Send + 'static> RuleBuilder<
+impl <R, Acc> RuleBuilder<
     Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
     Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
     Box<dyn Fn() -> Acc>,
     NoAssert,
-> {
+>
+where
+    Acc: Send + Clone + 'static,
+    R: Clone + 'static
+{
     pub fn assert(self, assert: Arc<dyn Fn(&Acc) -> bool + Send + Sync>) -> RuleBuilder<
         Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
@@ -351,12 +369,16 @@ impl <R: 'static, Acc: Send + 'static> RuleBuilder<
     }
 }
 
-impl <R: 'static, Acc: Send + 'static> RuleBuilder<
+impl <R, Acc> RuleBuilder<
     Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
     Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
     Box<dyn Fn() -> Acc>,
     Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
-> {
+>
+where
+    Acc: Send + Clone + 'static,
+    R: Clone + 'static
+{
     pub fn build(&self, assertion: &str) -> Box<dyn Rule> {
         Box::new(
             ConcreteRule::new(
@@ -370,6 +392,7 @@ impl <R: 'static, Acc: Send + 'static> RuleBuilder<
     }
 }
 
+#[derive(Clone)]
 pub struct ConcreteRule<Acc: Send + 'static, R: 'static> {
     state: Acc,
     test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
@@ -396,7 +419,11 @@ impl <Acc: Send + 'static, R: 'static> ConcreteRule<Acc, R> {
     }
 }
 
-impl <Acc: Send + 'static, R: 'static> Rule for ConcreteRule<Acc, R> {
+impl <Acc, R> Rule for ConcreteRule<Acc, R>
+    where
+        Acc: Send + Clone + 'static,
+        R: Clone + 'static
+{
 
     fn fold(&mut self, view: &NodeView, ctx: &HashMap<String, String>) {
         self.state = (self.fold)(&self.state, (self.test)(view, ctx))
@@ -421,9 +448,21 @@ pub struct NodeView {
 }
 
 impl NodeView {
+
+    pub fn new(attrs: HashMap<String, String>) -> Self {
+        Self {
+            attrs,
+            text: None
+
+        }
+    }
+    pub fn set_text(&mut self, text: &str) {
+        self.text = Some(String::from(text))
+    }
     pub fn text(&self) -> Option<&String> {
         self.text.as_ref()
     }
+
     pub fn attr(&self, key: &str) -> Option<&String> {
         self.attrs.get(key)
     }
@@ -431,10 +470,6 @@ impl NodeView {
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 pub struct Path(pub String);
-// pub enum Path {
-//     Root,
-//     Child(String)
-// }
 
 impl ToString for Path {
     fn to_string(&self) -> String {
