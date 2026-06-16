@@ -4,12 +4,12 @@ use tokio::sync::{Mutex, mpsc::Receiver};
 
 use crate::xmlworker::FileRuleResult;
 
-pub async fn collect_results<W: Write>(
-    collector_sender: &mut Receiver<FileRuleResult>,
-    output: W
+pub async fn collect_results/*<W: Write>*/(
+    collector_receiver: &mut Receiver<FileRuleResult>,
+    // output: W
 ) {
     let results: Mutex<HashMap<String, Vec<FileRuleResult>>> = Mutex::new(HashMap::new());
-    while let Some(file_results) = collector_sender.recv().await {
+    while let Some(file_results) = collector_receiver.recv().await {
         let mut results = results.lock().await;
         match results.get_mut(&file_results.file) {
             Some(file_rule_results) => {

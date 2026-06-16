@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 futures = "0.3.32"
+itertools = "0.14.0"
 quick-xml = { version = "0.40.1", features = ["async-tokio"] }
-tokio = "1.52.3"
+tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
 tokio-util = { version = "0.7.18", features = ["full", "io", "io-util"] }

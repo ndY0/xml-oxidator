@@ -101,9 +101,7 @@ impl From<BorrowError> for FileReaderError {
     }
 }
 
-// pub struct FileReader;
-
-pub async fn stream_validation<'a, S, B, E>(
+pub async fn read<'a, S, B, E>(
     file: &str,
     src: S,
     descriptors: Rc<RefCell<Node<'a>>>, 
