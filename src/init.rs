@@ -1,11 +1,11 @@
-use std::{cell::RefCell, fmt::Display, rc::Rc, sync::Arc};
-use futures::Stream;
+use std::{fmt::Display, sync::Arc};
+use futures::{Stream, future::join_all};
 use itertools::Itertools;
 use tokio::{runtime::Builder, sync::{Mutex, mpsc::{self, Sender, Receiver}}, task::JoinHandle};
 use tokio_util::bytes::Buf;
 use std::io::Error as IoError;
 
-use crate::{collector::collect_results, filereader::{TechnicalError, XmlWorkload, read}, rulebuilder::Node, xmlworker::{FileRuleResult, consume_xml_workload}};
+use crate::{collector::collect_results, filereader::{TechnicalError, XmlWorkload, read}, rulebuilder::{Tree}, xmlworker::{FileRuleResult, consume_xml_workload}};
 
 #[derive(Debug)]
 pub struct ValidatorError(String);
@@ -29,23 +29,23 @@ where
     E: Into<std::io::Error>,
 {
     filename: String,
-    stream_factory: Box<dyn FnOnce() -> S>
+    stream_factory: Box<dyn FnOnce() -> S + Send>
 
 }
 
-pub async fn start<'a, B, E, S>(
+pub async fn start<B, E, S>(
     file_receiver: Receiver<FileInfo<B, E, S>>,
     error_sender: &Sender<TechnicalError>,
-    descriptors: Node<'a>,
+    descriptors: &Tree,
     reader_count: usize,
     (worker_count_multiplier, worker_queue_size): (usize, usize),
     (collector_count, collector_queue_size): (usize, usize),
     reader_highwatermark: usize
 ) -> Result<(), ValidatorError>
 where
-    S: Stream<Item = Result<B, E>> + Unpin,
-    B: Buf,
-    E: Into<std::io::Error>,
+    S: Stream<Item = Result<B, E>> + Unpin + Send + 'static,
+    B: Buf + Send + 'static,
+    E: Into<std::io::Error> + 'static,
 {
 
     let readers_runtime = Builder::new_multi_thread()
@@ -108,16 +108,17 @@ where
     }).collect();
 
     // reader setup
-    // first off, we need to setup a queue for file to read
-    let (tx, rx) = mpsc::channel::<>(100);
     let rx = Arc::new(Mutex::new(file_receiver));
-    let reader_handles = (1..=collector_count)
+    let reader_handles: Vec<JoinHandle<()>> = (1..=collector_count)
     .zip(worker_senders.into_iter().chunks(worker_count_multiplier).into_iter())
-    .map(|(index, worker_senders)| {
+    .map(|(_index, worker_senders)| {
         let rx = rx.clone();
-        tokio::spawn(async move {
-            let sender_loop = worker_senders.collect::<Vec<Sender<XmlWorkload>>>().iter().cycle();
+        let mut sender_loop = worker_senders.collect::<Vec<Sender<XmlWorkload>>>().into_iter().cycle();
+        let cloned_descriptors = descriptors.clone();
+        let cloned_error_sender = error_sender.clone();
+        readers_runtime.spawn(async move {
             loop {
+                // let sent_descriptor = Arc::clone(&self)
                 let item = { rx.lock().await.recv().await };
                 match sender_loop.next() {
                     Some(current_sender) => {
@@ -129,9 +130,9 @@ where
                                 match read(
                                 &filename,
                                 stream_factory(),
-                                Rc::new(RefCell::new(descriptors)),
-                                current_sender,
-                                error_sender,
+                                &cloned_descriptors,
+                                &current_sender,
+                                &cloned_error_sender,
                                 reader_highwatermark
                             ).await {
                                    Ok(()) => {},
@@ -146,8 +147,8 @@ where
             }
         })
     }).collect();
-    for _ in 1..collector_count {
-    }
+    
+    join_all(reader_handles.into_iter().chain(worker_handles.into_iter()).chain(collector_handles.into_iter())).await;
 
     Ok(())
 }

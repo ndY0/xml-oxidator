@@ -1,10 +1,10 @@
-use std::{cell::{BorrowError, RefCell}, collections::HashMap, error::Error, fmt::Display, ops::AddAssign, rc::Rc};
+use std::{cell::BorrowError, collections::HashMap, error::Error, fmt::Display, ops::AddAssign};
 use futures::Stream;
 use tokio_util::{bytes::Buf, io::StreamReader};
 use tokio::sync::{Mutex, mpsc::{Receiver, Sender, channel, error::SendError}};
 use quick_xml::{Error as XmlError, Reader, events::{BytesStart, Event}};
 
-use crate::rulebuilder::{Node, NodeView, Path, Rule};
+use crate::rulebuilder::{Node, NodeView, Path, Rule, Tree};
 
 pub struct TechnicalError {
     pub error: String,
@@ -37,12 +37,12 @@ pub struct ReaderContext<'a> {
     mode: ReaderState,
     ignore_path: Vec<Path>,
     element_senders: HashMap<Vec<Path>, (Sender<NodeView>, PathIndex)>,
-    current_descriptor: Rc<RefCell<Node<'a>>>,
+    current_descriptor: &'a Node,
     current_view: Vec<NodeView>
 }
 
 impl <'a> ReaderContext<'a> {
-    pub fn new(descriptor: Rc<RefCell<Node<'a>>>) -> Self {
+    pub fn new(descriptor: &'a Node) -> Self {
         Self {
             current_descriptor: descriptor,
             current_path: Vec::new(),
@@ -53,12 +53,12 @@ impl <'a> ReaderContext<'a> {
         }
     }
 
-    pub fn match_child_swap_descriptor(&mut self, path: &Path) -> Result<bool, BorrowError> {
+    pub fn match_child_swap_descriptor(&mut self, tree: &'a Tree, path: &Path) -> bool {
 
-        let mut maybe_child: Option<Rc<RefCell<Node<'a>>>> = None;
-        let matched = match self.current_descriptor.try_borrow()?.children().get(path) {
+        let mut maybe_child: Option<&Node> = None;
+        let matched = match tree.children(self.current_descriptor).get(path) {
             Some(child) => {
-                maybe_child = Some(Rc::clone(&child.0));
+                maybe_child = Some(child);
                 true
             },
             None => false
@@ -69,7 +69,16 @@ impl <'a> ReaderContext<'a> {
             },
             None => {}
         };
-        Ok(matched)
+        matched
+    }
+
+    pub fn set_parent_swap_descriptor(&mut self, tree: &'a Tree) {
+        match tree.parent(self.current_descriptor) {
+            Some(parent) => {
+                self.current_descriptor = parent;
+            },
+            None => {}
+        }
     }
 }
 
@@ -104,7 +113,7 @@ impl From<BorrowError> for FileReaderError {
 pub async fn read<'a, S, B, E>(
     file: &str,
     src: S,
-    descriptors: Rc<RefCell<Node<'a>>>, 
+    descriptors: &'a Tree, 
     sender: &Sender<XmlWorkload>,
     error_sender: &Sender<TechnicalError>,
     highwatermark: usize
@@ -114,7 +123,7 @@ where
     B: Buf,
     E: Into<std::io::Error>,
 {
-    let reader_context: Mutex<ReaderContext> = Mutex::new(ReaderContext::new(descriptors));
+    let reader_context: Mutex<ReaderContext> = Mutex::new(ReaderContext::new(descriptors.get_root().ok_or(FileReaderError("empty descriptors".into()))?));
     let reader = StreamReader::new(src);
     let mut reader = Reader::from_reader(reader);
     let mut read_buf = Vec::new();
@@ -136,7 +145,7 @@ where
                         // if we hit the current descriptor path, we need to create a stream,
                         // register it and send the payload to the pool
                         // of workers
-                        if reader_context.current_descriptor.try_borrow()?.path().0.as_bytes() == tag.name().as_ref() {
+                        if reader_context.current_descriptor.path().0.as_bytes() == tag.name().as_ref() {
                             handle_path_match(
                                 file,
                                 tag,
@@ -149,7 +158,7 @@ where
                             // if not, we must look into the descriptor children to check
                             // for any match
                             
-                            match reader_context.match_child_swap_descriptor(&tag_path)? {
+                            match reader_context.match_child_swap_descriptor(&descriptors, &tag_path) {
                                 true => {
                                     // if found, we must trigger the same chain of events as for the matching tag one
                                     handle_path_match(
@@ -201,6 +210,8 @@ where
                                 };
                                 // we must pop the current path also, to ensure proper tracking
                                 reader_context.current_path.pop();
+                                // finally, we must restore the parent descriptor as current descriptor
+                                reader_context.set_parent_swap_descriptor(descriptors)
                             },
                             None => {}
                         }
@@ -234,7 +245,7 @@ async fn handle_path_match<'a, 'b>(
     // if there is no current channel, initiate one.
     // also push a new index to the stack
     // as long as the path
-    let path = reader_context.current_descriptor.try_borrow()?.path().clone();
+    let path = reader_context.current_descriptor.path().clone();
     reader_context.current_path.push(path);
     if !reader_context.element_senders.contains_key(&*reader_context.current_path) {
         // creating the channel
@@ -245,7 +256,7 @@ async fn handle_path_match<'a, 'b>(
                 file: file.to_string(),
                 path: reader_context.current_path.clone(),
                 tag: String::from_utf8_lossy(tag.name().into_inner()).to_string(),
-                rules: reader_context.current_descriptor.try_borrow()?.rules(),
+                rules: reader_context.current_descriptor.rules(),
                 events: rx,
             }
         ).await {

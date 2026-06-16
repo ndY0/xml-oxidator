@@ -1,23 +1,59 @@
-use std::{cell::RefCell, collections::HashMap, rc::{Rc, Weak}, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, fmt::Display, rc::Rc, sync::Arc};
 
+#[derive(Debug)]
+pub struct BuilderError(String);
 
-pub trait NodeHandler<'a> {
+impl Display for BuilderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "error: {}", self.0)
+    }
+}
+
+pub trait NodeHandler {
     type ToBuilderOuput;
-    fn add_node(&mut self, path: Path, node: Rc<RefCell<Node<'a>>>, map_from_parent: Option<&'a ParentPropertyMapper<'a>>);
+    fn add_node(&mut self, path: Path, node: usize, map_from_parent: Option<Box<dyn PropertyMapper>>);
     fn to_builder(self) -> Self::ToBuilderOuput;
 }
 
-pub trait NodeBuilder<'a> {
+pub trait NodeBuilder {
     type AddRuleOutput;
     type PathOutput;
     type BuildOutput;
     fn add_rule(self, rule: Box<dyn Rule>) -> Self::AddRuleOutput;
-    fn path(self, path: Path, map_from_parent: Option<&'a ParentPropertyMapper<'a>>) -> Self::PathOutput;
+    fn path(self, path: Path, map_from_parent: Option<Box<dyn PropertyMapper>>) -> Self::PathOutput;
     fn build(self) -> Self::BuildOutput;
 }
 
+// pub type PropertyMapper = Box<dyn Fn(&NodeView, &mut HashMap<String, String>)-> () + Send + Sync>;
+
+pub trait PropertyMapper
+where
+    Self: Sync + Send + DynClonePropertyMapper
+{
+    fn map(&self, view: &NodeView, ctx: &mut HashMap<String, String>);
+}
+
+// intermediate trait, necessary for the blanket impl
+pub trait DynClonePropertyMapper {
+    fn clone_box(&self) -> Box<dyn PropertyMapper>;
+}
+
+// blanket impl of the intermediate trait
+// it is important to restrict to Clone
+impl<T: PropertyMapper + Clone + 'static> DynClonePropertyMapper for T {
+    fn clone_box(&self) -> Box<dyn PropertyMapper> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn PropertyMapper> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
 pub trait Rule
-    where Self: Send + DynCloneRule 
+    where Self: Sync + Send + DynCloneRule 
 {
     fn fold(&mut self, view: &NodeView, ctx: &HashMap<String, String>);
     fn assert(&self) -> Diagnostic;
@@ -45,21 +81,23 @@ impl Clone for Box<dyn Rule> {
 pub struct InitState;
 pub struct NodeAdderState;
 
-pub struct Root<'a, State> {
+pub struct Root<State> {
     _state: std::marker::PhantomData<State>,
+    tree: Rc<RefCell<Tree>>,
     path: Path,
-    nodes: HashMap<Path, (Rc<RefCell<Node<'a>>>, Option<&'a ParentPropertyMapper<'a>>)>,
+    nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>,
     rules: Vec<Box<dyn Rule>>
 }
 
-impl <'a> NodeHandler<'a> for Root<'a, NodeAdderState> {
-    type ToBuilderOuput = Root<'a, InitState>;
-    fn add_node(&mut self, path: Path, node: Rc<RefCell<Node<'a>>>, map_from_parent: Option<&'a ParentPropertyMapper<'a>>) {
+impl <'a> NodeHandler for Root<NodeAdderState> {
+    type ToBuilderOuput = Root<InitState>;
+    fn add_node(&mut self, path: Path, node: usize, map_from_parent: Option<Box<dyn PropertyMapper>>) {
         self.nodes.insert(path, (node, map_from_parent));
     }
     fn to_builder(self) -> Self::ToBuilderOuput {
         Root {
             _state: std::marker::PhantomData,
+            tree: self.tree,
             nodes: self.nodes,
             path: self.path,
             rules: self.rules
@@ -67,50 +105,61 @@ impl <'a> NodeHandler<'a> for Root<'a, NodeAdderState> {
     }
 }
 
-impl <'a> NodeBuilder<'a> for Root<'a, InitState> {
-    type AddRuleOutput = Root<'a, InitState>;
+impl NodeBuilder for Root<InitState> {
+    type AddRuleOutput = Root<InitState>;
 
-    type PathOutput = Child<'a, InitState, Root<'a, NodeAdderState>>;
+    type PathOutput = Child<InitState, Root<NodeAdderState>>;
 
-    type BuildOutput = Rc<RefCell<Node<'a>>>;
+    type BuildOutput = Result<Tree, BuilderError>;
 
     fn add_rule(mut self, rule: Box<dyn Rule>) -> Self::AddRuleOutput {
         self.rules.push(rule);
         self
     }
 
-    fn path(self, path: Path, map_from_parent: Option<&'a ParentPropertyMapper<'a>>) -> Self::PathOutput {
+    fn path(self, path: Path, map_from_parent: Option<Box<dyn PropertyMapper>>) -> Self::PathOutput {
         let build_parent: Root<NodeAdderState> = Root {
             _state: std::marker::PhantomData,
+            tree: Rc::clone(&self.tree),
             nodes: self.nodes,
             path: self.path,
             rules: self.rules
         };
-        Child::new(build_parent, path, map_from_parent)
+        Child::new(build_parent, Rc::clone(&self.tree), path, map_from_parent)
     }
 
     fn build(self) -> Self::BuildOutput {
 
-        let parent = Rc::new(
-            RefCell::new(
-                Node::new(
-                    self.path,
-                    self.rules
-                )
-            )
+        // we create the parent node
+        let mut parent = Node::new(
+            self.path,
+            self.rules
         );
-        for (_1, (node, _2)) in &self.nodes {
-            node.borrow_mut().set_parent(&parent);
+        match Rc::try_unwrap(self.tree) {
+            Ok(tree) => {
+                let mut tree = tree.into_inner();
+                // for every child it declare, we must set it's parent with the help of the tree
+                let parent_index = tree.next_index();
+                for (_1, (node, _2)) in &self.nodes {
+                    tree.set_child_parent(*node, parent_index);
+                }
+                parent.set_nodes(self.nodes);
+                // we add the node to the vector
+                tree.add_node(parent);
+                Ok(tree)
+            },
+            Err(_) => {
+                Err(BuilderError("couldn't retrieve the shared tree under construction".into()))
+            }
         }
-        parent.borrow_mut().set_nodes(self.nodes);
-        parent
     }
 }
 
-impl <'a> Root<'a, InitState> {
+impl Root<InitState> {
     pub fn new(root: &str) -> Self {
         Self {
             _state: std::marker::PhantomData,
+            tree: Rc::new(RefCell::new(Tree::new())),
             path: Path(root.into()),
             nodes: HashMap::new(),
             rules: Vec::new()
@@ -118,26 +167,28 @@ impl <'a> Root<'a, InitState> {
     }
 }
 
-pub struct Child<'a, State, Parent> {
+pub struct Child<State, Parent> {
     _state: std::marker::PhantomData<State>,
-    map_from_parent: Option<&'a ParentPropertyMapper<'a>>,
+    tree: Rc<RefCell<Tree>>,
+    map_from_parent: Option<Box<dyn PropertyMapper>>,
     parent: Parent,
     path: Path,
-    nodes: HashMap<Path, (Rc<RefCell<Node<'a>>>, Option<&'a ParentPropertyMapper<'a>>)>,
+    nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>,
     rules: Vec<Box<dyn Rule>>
 }
 
-impl <'a, P: NodeHandler<'a>> NodeHandler<'a> for Child<'a, NodeAdderState, P> {
+impl <P: NodeHandler> NodeHandler for Child<NodeAdderState, P> {
     
-    type ToBuilderOuput = Child<'a, InitState, P>;
+    type ToBuilderOuput = Child<InitState, P>;
 
-    fn add_node(&mut self, path: Path, node: Rc<RefCell<Node<'a>>>, map_from_parent: Option<&'a ParentPropertyMapper<'a>>) {
+    fn add_node(&mut self, path: Path, node: usize, map_from_parent: Option<Box<dyn PropertyMapper>>) {
         self.nodes.insert(path, (node, map_from_parent));
     }
     
     fn to_builder(self) -> Self::ToBuilderOuput {
         Child {
             _state: std::marker::PhantomData,
+            tree: self.tree,
             nodes: self.nodes,
             map_from_parent: self.map_from_parent,
             path: self.path,
@@ -147,59 +198,64 @@ impl <'a, P: NodeHandler<'a>> NodeHandler<'a> for Child<'a, NodeAdderState, P> {
     }
 }
 
-impl <'a, P: NodeHandler<'a>> NodeBuilder<'a> for Child<'a, InitState, P> {
-    type AddRuleOutput = Child<'a, InitState, P>;
+impl <P: NodeHandler> NodeBuilder for Child<InitState, P> {
+    type AddRuleOutput = Child<InitState, P>;
 
-    type PathOutput = Child<'a, InitState, Child<'a, NodeAdderState, P>>;
+    type PathOutput = Child<InitState, Child<NodeAdderState, P>>;
 
-    type BuildOutput = <P as NodeHandler<'a>>::ToBuilderOuput;
+    type BuildOutput = <P as NodeHandler>::ToBuilderOuput;
 
     fn add_rule(mut self, rule: Box<dyn Rule>) -> Self::AddRuleOutput {
         self.rules.push(rule);
         self
     }
 
-    fn path(self, path: Path, map_from_parent: Option<&'a ParentPropertyMapper<'a>>) -> Self::PathOutput
-        where Child<'a, NodeAdderState, P>: NodeHandler<'a>
+    fn path(self, path: Path, map_from_parent: Option<Box<dyn PropertyMapper>>) -> Self::PathOutput
+        where Child<NodeAdderState, P>: NodeHandler
     {
         let build_parent = Child {
             _state: std::marker::PhantomData,
+            tree: Rc::clone(&self.tree),
             map_from_parent: self.map_from_parent,
             parent: self.parent,
             nodes: self.nodes,
             path: self.path,
             rules: self.rules
         };
-        Child::new(build_parent, path, map_from_parent)
+        Child::new(build_parent, Rc::clone(&self.tree), path, map_from_parent)
     }
 
     fn build(mut self) -> Self::BuildOutput {
-        let parent = Rc::new(
-            RefCell::new(
-                Node::new(
-                    self.path.clone(),
-                    self.rules
-                )
-            )
+        let mut parent = Node::new(
+            self.path.clone(),
+            self.rules
         );
+        let mut tree = self.tree.borrow_mut();
+        // for every child it declare, we must set it's parent with the help of the tree
+        let parent_index = tree.next_index();
         for (_1, (node, _2)) in &self.nodes {
-            node.borrow_mut().set_parent(&parent);
+            tree.set_child_parent(*node, parent_index);
         }
-        parent.borrow_mut().set_nodes(self.nodes);
-        self.parent.add_node(self.path, parent, self.map_from_parent);
+        parent.set_nodes(self.nodes);
+        // we add the node to the vector
+        tree.add_node(parent);
+
+        self.parent.add_node(self.path, parent_index, self.map_from_parent);
 
         self.parent.to_builder()
     }
 }
 
-impl <'a, P: NodeHandler<'a>> Child<'a, InitState, P> {
+impl <P: NodeHandler> Child<InitState, P> {
     pub fn new(
         parent: P,
+        tree: Rc<RefCell<Tree>>,
         path: Path,
-        map_from_parent: Option<&'a ParentPropertyMapper<'a>>
-    ) -> Child<'a, InitState, P> {
+        map_from_parent: Option<Box<dyn PropertyMapper>>
+    ) -> Child<InitState, P> {
         Child {
             _state: std::marker::PhantomData,
+            tree,
             path,
             map_from_parent,
             parent,
@@ -209,34 +265,79 @@ impl <'a, P: NodeHandler<'a>> Child<'a, InitState, P> {
     }
 }
 
-pub type ParentPropertyMapper<'a> = dyn Fn(&NodeView, &'a mut HashMap<String, String>);
+#[derive(Clone)]
+pub struct Tree {
+    pub nodes: Vec<Node>
+}
 
-pub struct Node<'a> {
+impl Tree {
+
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new()
+        }
+    }
+
+    pub fn get_root(&self) -> Option<&Node> {
+        self.nodes.get(self.nodes.len() - 1)
+    }
+
+    pub fn set_child_parent(&mut self, child_index: usize, parent_index: usize) {
+        match self.nodes.get_mut(child_index) {
+            Some(child) => {
+                child.parent = Some(parent_index);
+            },
+            None => {}
+        }
+    }
+
+    pub fn next_index(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn add_node(&mut self, node: Node) {
+        self.nodes.push(node);
+    }
+    
+    pub fn parent(&self, node: &Node) -> Option<&Node> {
+        let parent_index = node.parent?;
+        self.nodes.get(parent_index)
+    }
+
+    pub fn children<'a, 'b>(&'a self, node: &'b Node) -> HashMap<Path, &'a Node> {
+        node.nodes.iter()
+        .filter_map(|(path,(index, _selector))| {
+            self.nodes.get(*index).and_then(|node| {Some((path.clone(), node))})
+        }).collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct Node {
     path: Path,
     rules: Vec<Box<dyn Rule>>,
-    nodes: HashMap<Path, (Rc<RefCell<Node<'a>>>, Option<&'a ParentPropertyMapper<'a>>)>,
-    parent: Weak<RefCell<Node<'a>>>
+    nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>,
+    parent: Option<usize>
 
 }
 
-impl <'a> Node<'a> {
+impl Node {
     pub fn new(
         path: Path,
         rules: Vec<Box<dyn Rule>>,
-        // nodes: HashMap<Path, (Rc<Node<'a>>, Option<&'a ParentPropertyMapper<'a>>)>,
     ) -> Self {
         Self {
             path,
             rules,
             nodes: HashMap::default(),
-            parent: Weak::default()
+            parent: None
         }
     }
-    pub fn set_nodes(&mut self, nodes: HashMap<Path, (Rc<RefCell<Node<'a>>>, Option<&'a ParentPropertyMapper<'a>>)>) {
+    pub fn set_nodes(&mut self, nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>) {
         self.nodes = nodes;
     }
-    pub fn set_parent(&mut self, parent: &Rc<RefCell<Node<'a>>>) {
-        self.parent = Rc::downgrade(parent)
+    pub fn set_parent(&mut self, parent: usize) {
+        self.parent = Some(parent);
     }
 
     pub fn path(&self) -> &Path {
@@ -245,14 +346,6 @@ impl <'a> Node<'a> {
 
     pub fn rules(&self) -> Vec<Box<dyn Rule>> {
         self.rules.clone()
-    }
-
-    pub fn children(&self) -> &HashMap<Path, (Rc<RefCell<Node<'a>>>, Option<&'a ParentPropertyMapper<'a>>)> {
-        &self.nodes
-    }
-
-    pub fn parent(&self) -> &Weak<RefCell<Node<'a>>> {
-        &self.parent
     }
 }
 
@@ -376,7 +469,7 @@ impl <R, Acc> RuleBuilder<
     Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
 >
 where
-    Acc: Send + Clone + 'static,
+    Acc: Sync + Send + Clone + 'static,
     R: Clone + 'static
 {
     pub fn build(&self, assertion: &str) -> Box<dyn Rule> {
@@ -421,7 +514,7 @@ impl <Acc: Send + 'static, R: 'static> ConcreteRule<Acc, R> {
 
 impl <Acc, R> Rule for ConcreteRule<Acc, R>
     where
-        Acc: Send + Clone + 'static,
+        Acc: Sync + Send + Clone + 'static,
         R: Clone + 'static
 {
 
