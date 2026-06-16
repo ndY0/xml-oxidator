@@ -38,8 +38,9 @@ pub async fn start<B, E, S>(
     error_sender: &Sender<TechnicalError>,
     descriptors: &Tree,
     reader_count: usize,
-    (worker_count_multiplier, worker_queue_size): (usize, usize),
-    (collector_count, collector_queue_size): (usize, usize),
+    worker_count_multiplier: usize,
+    worker_queue_size: usize,
+    collector_queue_size: usize,
     reader_highwatermark: usize
 ) -> Result<(), ValidatorError>
 where
@@ -48,18 +49,18 @@ where
     E: Into<std::io::Error> + 'static,
 {
 
-    let readers_runtime = Builder::new_multi_thread()
+    let readers_runtime: tokio::runtime::Runtime = Builder::new_multi_thread()
     .worker_threads(reader_count)
     .thread_name("reader-pool")
     .build()?;
 
     let workers_runtime = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(worker_count_multiplier * collector_count)
+    .worker_threads(worker_count_multiplier * reader_count)
     .thread_name("rule-pool")
     .build()?;
 
     let collectors_runtime = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(collector_count)
+    .worker_threads(reader_count)
     .thread_name("collector-pool")
     .build()?;
     
@@ -70,7 +71,7 @@ where
     ): (
         Vec<Sender<FileRuleResult>>,
         Vec<Receiver<FileRuleResult>>
-    ) = (1..=collector_count)
+    ) = (1..=reader_count)
     .map(|_| mpsc::channel::<FileRuleResult>(collector_queue_size))
     .unzip();
     let collector_handles: Vec<JoinHandle<()>> = collector_receivers.into_iter()
@@ -88,12 +89,12 @@ where
     ): (
         Vec<Sender<XmlWorkload>>,
         Vec<Receiver<XmlWorkload>>
-    ) = (1..=worker_count_multiplier * collector_count)
+    ) = (1..=worker_count_multiplier * reader_count)
     .map(|_| mpsc::channel::<XmlWorkload>(worker_queue_size))
     .unzip();
     let worker_handles: Vec<JoinHandle<()>> = worker_receivers.into_iter()
     // we want a uniform distribution, so we are cycling iterator, and capping it
-    .zip(collector_senders.into_iter().cycle().take(worker_count_multiplier * collector_count))
+    .zip(collector_senders.into_iter().cycle().take(worker_count_multiplier * reader_count))
     .map(|(mut rx, sender)| {
         workers_runtime.spawn( async move {
             loop {
@@ -109,7 +110,7 @@ where
 
     // reader setup
     let rx = Arc::new(Mutex::new(file_receiver));
-    let reader_handles: Vec<JoinHandle<()>> = (1..=collector_count)
+    let reader_handles: Vec<JoinHandle<()>> = (1..=reader_count)
     .zip(worker_senders.into_iter().chunks(worker_count_multiplier).into_iter())
     .map(|(_index, worker_senders)| {
         let rx = rx.clone();
