@@ -1,5 +1,6 @@
 use std::{cell::RefCell, collections::HashMap, fmt::Display, rc::Rc, sync::Arc};
 use std::fmt::Debug;
+use educe::Educe;
 
 #[derive(Debug)]
 pub struct BuilderError(String);
@@ -350,6 +351,7 @@ impl Node {
     }
 }
 
+#[derive(Debug)]
 pub struct RuleResult(pub String, pub String, pub bool, pub String);
 
 pub struct NoTest;
@@ -475,7 +477,7 @@ impl <R, Acc> RuleBuilder<
     Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
 >
 where
-    Acc: Sync + Send + Clone + 'static,
+    Acc: Debug + Sync + Send + Clone + 'static,
     R: Clone + 'static
 {
     pub fn build(&self, assertion: &str) -> Box<dyn Rule> {
@@ -492,17 +494,21 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ConcreteRule<Acc: Send + 'static, R: 'static> {
+#[derive(Clone, Educe)]
+#[educe(Debug)]
+pub struct ConcreteRule<Acc: Send + Debug + 'static, R: 'static> {
     name: String,
     state: Acc,
+    #[educe(Debug(ignore))]
     test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+    #[educe(Debug(ignore))]
     fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
+    #[educe(Debug(ignore))]
     assert: Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
     assertion: String
 }
 
-impl <Acc: Send + 'static, R: 'static> ConcreteRule<Acc, R> {
+impl <Acc: Debug + Send + 'static, R: 'static> ConcreteRule<Acc, R> {
     pub fn new(
         name: String,
         init: Acc,
@@ -524,7 +530,7 @@ impl <Acc: Send + 'static, R: 'static> ConcreteRule<Acc, R> {
 
 impl <Acc, R> Rule for ConcreteRule<Acc, R>
     where
-        Acc: Sync + Send + Clone + 'static,
+        Acc: Debug + Sync + Send + Clone + 'static,
         R: Clone + 'static
 {
 

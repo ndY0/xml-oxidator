@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc::channel;
 use tokio_test::io::{Builder, Mock};
 
-use xml_oxydizer::{init::{FileInfo, start}, rulebuilder::{NodeBuilder, Root, RuleBuilder, Tree}};
+use xml_oxydizer::{init::{FileInfo, start}, rulebuilder::{NodeBuilder, Path, Root, RuleBuilder, Tree}};
 
 fn build_simple_descriptors() -> Tree {
     Root::new("root")
@@ -16,15 +16,34 @@ fn build_simple_descriptors() -> Tree {
         .assert(Arc::new(|acc| {*acc}))
         .build("root \"test\" attribute is not of value \"value\"")
     )
-    .build().unwrap()
+    .path(Path("child".into()), None)
+        .add_rule(
+            RuleBuilder::test(
+                "test_child".into(),
+                Arc::new(|view, _ctx| { view.attr("test2").is_some_and(|value| {value == "value2"}) })
+            )
+            .fold(Arc::new(|acc, curr| {*acc || curr}))
+            .init(Box::new(|| {false}))
+            .assert(Arc::new(|acc| {*acc}))
+            .build("root \"test2\" attribute is not of value \"value2\"")
+        )
+        .build()
+    .build()
+    .unwrap()
 }
 
 fn build_simple_async_xml_reader() -> Mock {
-    Builder::new()
-    .read(b"<root test=\"value\">content root<child test2=\"value2\">")
-    .wait(Duration::from_micros(10))
-    .read(b"<child/></root>")
-    .build()
+    let mut builder = Builder::new();
+    builder
+    .read(b"<root test=\"vaue\">content root");
+
+    for _ in 1..=10_000 {
+        builder
+        .read(b"<child test2=\"value2\">")
+        .read(b"</child>");
+    }
+    builder.read(b"</root>");
+    builder.build()
 }
 
 #[tokio::test]
@@ -70,7 +89,7 @@ async fn test_small_simple_file() {
 
         }
     };
-    match error_receiver.recv().await {
+    match diagnostic_receiver.recv().await {
         Some(data) => {
             println!("received data : {:?}", data);
         },

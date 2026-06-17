@@ -60,6 +60,7 @@ pub async fn collect_results(
         let mut results = results.lock().await;
         match file_results {
             FileResult::Progress(file_id, file_name, mut rule_results) => {
+                dbg!(&rule_results);
                 match results.get_mut(&file_id) {
                     Some((_file_name, file_rule_results)) => {
                         file_rule_results.append(&mut rule_results);
@@ -72,30 +73,32 @@ pub async fn collect_results(
                 }
             },
             FileResult::Terminated(file_id, file_name) => {
-                match results.remove(&file_id) {
-                    Some((file_name, file_rule_results)) => {
-                        match diagnostic_sender.send((file_name, file_rule_results).into()).await {
-                            Ok(_) => {},
-                            Err(err) => {
-                                error_sender.send(TechnicalError {
-                                    error: err.to_string(),
-                                    file: file_id.to_string()
-                                }).await?
-                            }
-                        }
-                    },
-                    None => {
-                        match diagnostic_sender.send((file_name, vec![]).into()).await {
-                            Ok(_) => {},
-                            Err(err) => {
-                                error_sender.send(TechnicalError {
-                                    error: err.to_string(),
-                                    file: file_id.to_string()
-                                }).await?
-                            }
-                        }
-                    }
-                }
+                dbg!(&file_name);
+                // TODO: add a counter for payload tracking and actual completion
+                // match results.remove(&file_id) {
+                //     Some((file_name, file_rule_results)) => {
+                //         match diagnostic_sender.send((file_name, file_rule_results).into()).await {
+                //             Ok(_) => {},
+                //             Err(err) => {
+                //                 error_sender.send(TechnicalError {
+                //                     error: err.to_string(),
+                //                     file: file_id.to_string()
+                //                 }).await?
+                //             }
+                //         }
+                //     },
+                //     None => {
+                //         match diagnostic_sender.send((file_name, vec![]).into()).await {
+                //             Ok(_) => {},
+                //             Err(err) => {
+                //                 error_sender.send(TechnicalError {
+                //                     error: err.to_string(),
+                //                     file: file_id.to_string()
+                //                 }).await?
+                //             }
+                //         }
+                //     }
+                // }
             }
         }
     }

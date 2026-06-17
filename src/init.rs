@@ -65,6 +65,7 @@ where
     let global_file_id_seq = Arc::new(AtomicU64::new(0));
     let readers_runtime: tokio::runtime::Runtime = Builder::new_multi_thread()
     .worker_threads(reader_count)
+    .enable_time()
     .thread_name("reader-pool")
     .build()?;
 
@@ -77,7 +78,6 @@ where
     .worker_threads(reader_count)
     .thread_name("collector-pool")
     .build()?;
-    
     // collector workers setup
     let (
         collector_senders,

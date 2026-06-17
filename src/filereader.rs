@@ -137,7 +137,6 @@ where
         let mut reader_context =  reader_context.lock().await;
         match reader.read_event_into_async(&mut read_buf).await? {
             Event::Start(tag) => {
-                dbg!(reader_context);
                 let tag_path = Path(String::from_utf8_lossy(tag.name().as_ref()).into());
                 match &reader_context.mode {
                     ReaderState::Ignoring => {
