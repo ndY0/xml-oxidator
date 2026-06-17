@@ -4,9 +4,9 @@ use tokio::sync::mpsc::{Receiver, Sender, error::SendError};
 
 use crate::{filereader::XmlWorkload, rulebuilder::RuleResult};
 
-pub struct FileRuleResult {
-    pub file: String,
-    pub rule_results: Vec<RuleResult>
+pub enum FileResult {
+    Progress(u64, String, Vec<RuleResult>),
+    Terminated(u64, String)
 }
 
 #[derive(Debug)]
@@ -26,7 +26,7 @@ impl <T> From<SendError<T>> for ConsumerError {
 
 pub async fn consume_xml_workload(
     workload_receiver: &mut Receiver<XmlWorkload>,
-    collector_sender: &Sender<FileRuleResult>
+    collector_sender: &Sender<FileResult>
 ) -> Result<(), ConsumerError> {
 
     while let Some(mut payload) = workload_receiver.recv().await {
@@ -42,12 +42,14 @@ pub async fn consume_xml_workload(
         let results: Vec<RuleResult> = payload.rules.iter()
         .map(|rule| {
             let diagnostic = rule.assert();
-            RuleResult(payload.path.iter().fold("".into(), |acc, path| { format!("{}/{}", acc, path.0) }), diagnostic.statut, diagnostic.assertion)
+            RuleResult(
+                payload.path.iter().fold("".into(), |acc, path| { format!("{}/{}", acc, path.0) }),
+                diagnostic.rule_name,
+                diagnostic.statut,
+                diagnostic.assertion
+            )
         }).collect();
-        collector_sender.send(FileRuleResult {
-            file: payload.file,
-            rule_results: results
-        }).await?;
+        collector_sender.send(FileResult::Progress(payload.file_id, payload.file, results)).await?;
     }
     Ok(())
 }

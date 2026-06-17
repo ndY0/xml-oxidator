@@ -1,27 +1,103 @@
-use std::{collections::HashMap};
+use std::{collections::HashMap, error::Error, fmt::Display};
+use tokio::sync::{Mutex, mpsc::{Receiver, Sender, error::SendError}};
 
-use tokio::sync::{Mutex, mpsc::Receiver};
+use crate::{filereader::TechnicalError, rulebuilder::RuleResult, xmlworker::FileResult};
 
-use crate::xmlworker::FileRuleResult;
+#[derive(Debug)]
+pub struct CollectorError(String);
 
-pub async fn collect_results/*<W: Write>*/(
-    collector_receiver: &mut Receiver<FileRuleResult>,
-    // output: W
-) {
-    let results: Mutex<HashMap<String, Vec<FileRuleResult>>> = Mutex::new(HashMap::new());
+impl Display for CollectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "error: {}", self.0)
+    }
+}
+impl Error for CollectorError {}
+
+impl <T> From<SendError<T>> for CollectorError {
+    fn from(value: SendError<T>) -> Self {
+        CollectorError(value.to_string())
+    }
+}
+
+#[derive(Debug)]
+pub struct FullDiagnostic {
+    pub filename: String,
+    pub diagnotics: Vec<RuleDiagnostic>
+}
+
+#[derive(Debug)]
+pub struct RuleDiagnostic {
+    pub rule_name: String,
+    pub path: String,
+    pub status: bool,
+    pub comment: String
+}
+
+impl From<(String, Vec<RuleResult>)> for FullDiagnostic {
+    fn from((file_name, rule_results): (String, Vec<RuleResult>)) -> Self {
+        FullDiagnostic {
+            filename: file_name,
+            diagnotics: rule_results.iter()
+            .map(|RuleResult(rule_name, path, status, comment)| {
+                RuleDiagnostic {
+                    rule_name: rule_name.clone(),
+                    path: path.clone(),
+                    status: *status,
+                    comment: comment.clone()
+                }
+            }).collect()
+        }
+    }
+}
+
+pub async fn collect_results(
+    collector_receiver: &mut Receiver<FileResult>,
+    diagnostic_sender: &Sender<FullDiagnostic>,
+    error_sender: &Sender<TechnicalError>,
+) -> Result<(), CollectorError> {
+    let results: Mutex<HashMap<u64, (String, Vec<RuleResult>)>> = Mutex::new(HashMap::new());
     while let Some(file_results) = collector_receiver.recv().await {
         let mut results = results.lock().await;
-        match results.get_mut(&file_results.file) {
-            Some(file_rule_results) => {
-                file_rule_results.push(file_results);
+        match file_results {
+            FileResult::Progress(file_id, file_name, mut rule_results) => {
+                match results.get_mut(&file_id) {
+                    Some((_file_name, file_rule_results)) => {
+                        file_rule_results.append(&mut rule_results);
+                    },
+                    None => {
+                        let mut file_rule_results: Vec<RuleResult> = Vec::new();
+                        file_rule_results.append(&mut rule_results);
+                        results.insert(file_id, (file_name, file_rule_results));
+                    }
+                }
             },
-            None => {
-                let file = file_results.file.clone();
-                let mut file_rule_results: Vec<FileRuleResult> = Vec::new();
-                file_rule_results.push(file_results);
-                results.insert(file, file_rule_results);
-
+            FileResult::Terminated(file_id, file_name) => {
+                match results.remove(&file_id) {
+                    Some((file_name, file_rule_results)) => {
+                        match diagnostic_sender.send((file_name, file_rule_results).into()).await {
+                            Ok(_) => {},
+                            Err(err) => {
+                                error_sender.send(TechnicalError {
+                                    error: err.to_string(),
+                                    file: file_id.to_string()
+                                }).await?
+                            }
+                        }
+                    },
+                    None => {
+                        match diagnostic_sender.send((file_name, vec![]).into()).await {
+                            Ok(_) => {},
+                            Err(err) => {
+                                error_sender.send(TechnicalError {
+                                    error: err.to_string(),
+                                    file: file_id.to_string()
+                                }).await?
+                            }
+                        }
+                    }
+                }
             }
         }
     }
+    Ok(())
 }

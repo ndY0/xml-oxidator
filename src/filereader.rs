@@ -1,17 +1,18 @@
-use std::{cell::BorrowError, collections::HashMap, error::Error, fmt::Display, ops::AddAssign};
-use futures::Stream;
-use tokio_util::{bytes::Buf, io::StreamReader};
-use tokio::sync::{Mutex, mpsc::{Receiver, Sender, channel, error::SendError}};
+use std::{cell::BorrowError, collections::HashMap, error::Error, fmt::Display, ops::AddAssign, sync::Arc};
+use tokio::{io::{AsyncRead, BufReader}, sync::{Mutex, mpsc::{Receiver, Sender, channel, error::SendError}}};
 use quick_xml::{Error as XmlError, Reader, events::{BytesStart, Event}};
 
-use crate::rulebuilder::{Node, NodeView, Path, Rule, Tree};
+use crate::{rulebuilder::{Node, NodeView, Path, Rule, Tree}, xmlworker::FileResult};
 
+#[derive(Debug)]
 pub struct TechnicalError {
     pub error: String,
     pub file: String
 }
 
+#[derive(Debug)]
 pub struct XmlWorkload {
+    pub file_id: u64,
     pub file: String,
     pub tag: String,
     pub path: Vec<Path>,
@@ -19,11 +20,13 @@ pub struct XmlWorkload {
     pub events: Receiver<NodeView>
 }
 
+#[derive(Debug)]
 pub enum ReaderState {
     Reading,
     Ignoring
 }
 
+#[derive(Debug)]
 pub struct PathIndex(u32);
 
 impl AddAssign<u32> for PathIndex {
@@ -32,6 +35,7 @@ impl AddAssign<u32> for PathIndex {
     }
 } 
 
+#[derive(Debug)]
 pub struct ReaderContext<'a> {
     current_path: Vec<Path>,
     mode: ReaderState,
@@ -110,21 +114,21 @@ impl From<BorrowError> for FileReaderError {
     }
 }
 
-pub async fn read<'a, S, B, E>(
+pub async fn read<S>(
+    file_id: u64,
     file: &str,
     src: S,
-    descriptors: &'a Tree, 
+    descriptors: Arc<Tree>, 
     sender: &Sender<XmlWorkload>,
+    collector_sender: &Sender<FileResult>,
     error_sender: &Sender<TechnicalError>,
     highwatermark: usize
 ) -> Result<(), FileReaderError>
 where
-    S: Stream<Item = Result<B, E>> + Unpin,
-    B: Buf,
-    E: Into<std::io::Error>,
+    S: AsyncRead + Unpin,
 {
     let reader_context: Mutex<ReaderContext> = Mutex::new(ReaderContext::new(descriptors.get_root().ok_or(FileReaderError("empty descriptors".into()))?));
-    let reader = StreamReader::new(src);
+    let reader = BufReader::new(src);
     let mut reader = Reader::from_reader(reader);
     let mut read_buf = Vec::new();
     reader.config_mut().trim_text(true);
@@ -133,6 +137,7 @@ where
         let mut reader_context =  reader_context.lock().await;
         match reader.read_event_into_async(&mut read_buf).await? {
             Event::Start(tag) => {
+                dbg!(reader_context);
                 let tag_path = Path(String::from_utf8_lossy(tag.name().as_ref()).into());
                 match &reader_context.mode {
                     ReaderState::Ignoring => {
@@ -147,6 +152,7 @@ where
                         // of workers
                         if reader_context.current_descriptor.path().0.as_bytes() == tag.name().as_ref() {
                             handle_path_match(
+                                file_id,
                                 file,
                                 tag,
                                 &mut reader_context,
@@ -162,6 +168,7 @@ where
                                 true => {
                                     // if found, we must trigger the same chain of events as for the matching tag one
                                     handle_path_match(
+                                        file_id,
                                         file,
                                         tag,
                                         &mut reader_context,
@@ -211,7 +218,7 @@ where
                                 // we must pop the current path also, to ensure proper tracking
                                 reader_context.current_path.pop();
                                 // finally, we must restore the parent descriptor as current descriptor
-                                reader_context.set_parent_swap_descriptor(descriptors)
+                                reader_context.set_parent_swap_descriptor(&descriptors)
                             },
                             None => {}
                         }
@@ -226,6 +233,21 @@ where
                 view.set_text(String::from_utf8_lossy(&text.into_inner()).trim());
             },
             Event::Eof => {
+                // we need to send the termination of file to the collector so that it can emit the diagnostic
+                match collector_sender.send(FileResult::Terminated(file_id, file.into())).await {
+                    Ok(_) => {},
+                    Err(err) => {
+                        match &err.0 {
+                            FileResult::Progress(_, file_name, _) |
+                            FileResult::Terminated(_, file_name) => {
+                                error_sender.send(TechnicalError {
+                                    error: err.to_string(),
+                                    file: file_name.to_string()
+                                }).await?
+                            }
+                        }
+                    }
+                };
                 break;
             },
             _ => { continue; }
@@ -235,6 +257,7 @@ where
 }
 
 async fn handle_path_match<'a, 'b>(
+    file_id: u64,
     file: &str,
     tag: BytesStart<'_>,
     reader_context: &'b mut ReaderContext<'a>,
@@ -253,6 +276,7 @@ async fn handle_path_match<'a, 'b>(
         //send the worload, including the event receiver
         match sender.send(
             XmlWorkload {
+                file_id,
                 file: file.to_string(),
                 path: reader_context.current_path.clone(),
                 tag: String::from_utf8_lossy(tag.name().into_inner()).to_string(),

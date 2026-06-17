@@ -1,4 +1,5 @@
 use std::{cell::RefCell, collections::HashMap, fmt::Display, rc::Rc, sync::Arc};
+use std::fmt::Debug;
 
 #[derive(Debug)]
 pub struct BuilderError(String);
@@ -28,7 +29,7 @@ pub trait NodeBuilder {
 
 pub trait PropertyMapper
 where
-    Self: Sync + Send + DynClonePropertyMapper
+    Self: Sync + Send + DynClonePropertyMapper + Debug
 {
     fn map(&self, view: &NodeView, ctx: &mut HashMap<String, String>);
 }
@@ -53,7 +54,7 @@ impl Clone for Box<dyn PropertyMapper> {
 }
 
 pub trait Rule
-    where Self: Sync + Send + DynCloneRule 
+    where Self: Sync + Send + DynCloneRule + Debug
 {
     fn fold(&mut self, view: &NodeView, ctx: &HashMap<String, String>);
     fn assert(&self) -> Diagnostic;
@@ -312,7 +313,7 @@ impl Tree {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Node {
     path: Path,
     rules: Vec<Box<dyn Rule>>,
@@ -349,7 +350,7 @@ impl Node {
     }
 }
 
-pub struct RuleResult(pub String, pub bool, pub String);
+pub struct RuleResult(pub String, pub String, pub bool, pub String);
 
 pub struct NoTest;
 pub struct NoFold;
@@ -362,6 +363,7 @@ pub struct RuleBuilder<
     InitType,
     AssertType,
 > {
+    name: String,
     test: TestType,
     fold: FoldType,
     init: InitType,
@@ -373,13 +375,14 @@ impl RuleBuilder<
     NoInit,
     NoAssert,
 > {
-    pub fn test<R>(test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>) -> RuleBuilder<
+    pub fn test<R>(name: String, test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>) -> RuleBuilder<
         Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
         NoFold,
         NoInit,
         NoAssert,
     > {
         RuleBuilder {
+            name,
             test: test,
             fold: NoFold,
             init: NoInit,
@@ -404,6 +407,7 @@ where
         NoAssert,
     > {
         RuleBuilder {
+            name: self.name,
             test: self.test,
             fold: fold,
             init: NoInit,
@@ -429,6 +433,7 @@ where
         NoAssert,
     > {
         RuleBuilder {
+            name: self.name,
             test: self.test,
             fold: self.fold,
             init: init,
@@ -454,6 +459,7 @@ where
         Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
     > {
         RuleBuilder {
+            name: self.name,
             test: self.test,
             fold: self.fold,
             init: self.init,
@@ -475,6 +481,7 @@ where
     pub fn build(&self, assertion: &str) -> Box<dyn Rule> {
         Box::new(
             ConcreteRule::new(
+                self.name.clone(),
                 (self.init)(),
                 Arc::clone(&self.test),
                 Arc::clone(&self.fold),
@@ -485,8 +492,9 @@ where
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConcreteRule<Acc: Send + 'static, R: 'static> {
+    name: String,
     state: Acc,
     test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
     fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
@@ -496,6 +504,7 @@ pub struct ConcreteRule<Acc: Send + 'static, R: 'static> {
 
 impl <Acc: Send + 'static, R: 'static> ConcreteRule<Acc, R> {
     pub fn new(
+        name: String,
         init: Acc,
         test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
         fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
@@ -503,6 +512,7 @@ impl <Acc: Send + 'static, R: 'static> ConcreteRule<Acc, R> {
         assertion: String, 
     ) -> Self {
         Self {
+            name,
             state: init,
             test,
             fold,
@@ -524,6 +534,7 @@ impl <Acc, R> Rule for ConcreteRule<Acc, R>
 
     fn assert(&self) -> Diagnostic {
         Diagnostic {
+            rule_name: self.name.clone(),
             assertion: self.assertion.clone(),
             statut: (self.assert)(&self.state)
         }
@@ -531,10 +542,12 @@ impl <Acc, R> Rule for ConcreteRule<Acc, R>
 }
 
 pub struct Diagnostic {
+    pub rule_name: String,
     pub assertion: String,
     pub statut: bool
 }
 
+#[derive(Debug)]
 pub struct NodeView {
     text: Option<String>,
     attrs: HashMap<String, String>
@@ -561,7 +574,7 @@ impl NodeView {
     }
 }
 
-#[derive(PartialEq, Eq, Hash, Clone)]
+#[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct Path(pub String);
 
 impl ToString for Path {

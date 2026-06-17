@@ -1,11 +1,10 @@
-use std::{fmt::Display, sync::Arc};
-use futures::{Stream, future::join_all};
+use std::{fmt::Display, sync::{Arc, atomic::AtomicU64}};
+use futures::future::join_all;
 use itertools::Itertools;
-use tokio::{runtime::Builder, sync::{Mutex, mpsc::{self, Sender, Receiver}}, task::JoinHandle};
-use tokio_util::bytes::Buf;
+use tokio::{io::AsyncRead, runtime::Builder, sync::{Mutex, mpsc::{self, Receiver, Sender}}, task::JoinHandle};
 use std::io::Error as IoError;
 
-use crate::{collector::collect_results, filereader::{TechnicalError, XmlWorkload, read}, rulebuilder::{Tree}, xmlworker::{FileRuleResult, consume_xml_workload}};
+use crate::{collector::{FullDiagnostic, collect_results}, filereader::{TechnicalError, XmlWorkload, read}, rulebuilder::Tree, xmlworker::{FileResult, consume_xml_workload}};
 
 #[derive(Debug)]
 pub struct ValidatorError(String);
@@ -22,21 +21,38 @@ impl From<IoError> for ValidatorError {
     }
 }
 
-pub struct FileInfo<B, E, S>
+pub struct FileInfo<S>
 where
-    S: Stream<Item = Result<B, E>> + Unpin,
-    B: Buf,
-    E: Into<std::io::Error>,
+    S: AsyncRead + Unpin
 {
     filename: String,
+    descriptors: Arc<Tree>,
     stream_factory: Box<dyn FnOnce() -> S + Send>
 
 }
 
-pub async fn start<B, E, S>(
-    file_receiver: Receiver<FileInfo<B, E, S>>,
+impl <S> FileInfo<S>
+where
+    S: AsyncRead + Unpin
+{
+    pub fn new(
+        filename: &str,
+        descriptors: Arc<Tree>,
+        stream_factory: Box<dyn FnOnce() -> S + Send>
+
+    ) -> Self {
+        Self {
+            filename: filename.into(),
+            descriptors,
+            stream_factory
+        }
+    }
+}
+
+pub async fn start<S>(
+    file_receiver: Receiver<FileInfo<S>>,
     error_sender: &Sender<TechnicalError>,
-    descriptors: &Tree,
+    diagnostic_sender: &Sender<FullDiagnostic>,
     reader_count: usize,
     worker_count_multiplier: usize,
     worker_queue_size: usize,
@@ -44,11 +60,9 @@ pub async fn start<B, E, S>(
     reader_highwatermark: usize
 ) -> Result<(), ValidatorError>
 where
-    S: Stream<Item = Result<B, E>> + Unpin + Send + 'static,
-    B: Buf + Send + 'static,
-    E: Into<std::io::Error> + 'static,
+    S: AsyncRead + Unpin + Send + 'static
 {
-
+    let global_file_id_seq = Arc::new(AtomicU64::new(0));
     let readers_runtime: tokio::runtime::Runtime = Builder::new_multi_thread()
     .worker_threads(reader_count)
     .thread_name("reader-pool")
@@ -69,16 +83,26 @@ where
         collector_senders,
         collector_receivers
     ): (
-        Vec<Sender<FileRuleResult>>,
-        Vec<Receiver<FileRuleResult>>
+        Vec<Sender<FileResult>>,
+        Vec<Receiver<FileResult>>
     ) = (1..=reader_count)
-    .map(|_| mpsc::channel::<FileRuleResult>(collector_queue_size))
+    .map(|_| mpsc::channel::<FileResult>(collector_queue_size))
     .unzip();
     let collector_handles: Vec<JoinHandle<()>> = collector_receivers.into_iter()
     .map(|mut rx| {
-        // let (tx, mut rx) = mpsc::channel::<FileRuleResult>(collector_queue_size);
+        let cloned_error_sender = error_sender.clone();
+        let cloned_diagnostic_sender = diagnostic_sender.clone();
         collectors_runtime.spawn( async move {
-            collect_results(&mut rx).await
+            match collect_results(
+                &mut rx,
+                &cloned_diagnostic_sender,
+                &cloned_error_sender
+            ).await {
+                Ok(_) => {},
+                Err(err) => {
+                    println!("an error occured : {:?}", err)
+                }
+            }
         })
     }).collect();
 
@@ -94,7 +118,7 @@ where
     .unzip();
     let worker_handles: Vec<JoinHandle<()>> = worker_receivers.into_iter()
     // we want a uniform distribution, so we are cycling iterator, and capping it
-    .zip(collector_senders.into_iter().cycle().take(worker_count_multiplier * reader_count))
+    .zip(collector_senders.clone().into_iter().cycle().take(worker_count_multiplier * reader_count))
     .map(|(mut rx, sender)| {
         workers_runtime.spawn( async move {
             loop {
@@ -111,12 +135,13 @@ where
     // reader setup
     let rx = Arc::new(Mutex::new(file_receiver));
     let reader_handles: Vec<JoinHandle<()>> = (1..=reader_count)
+    .zip(collector_senders.into_iter())
     .zip(worker_senders.into_iter().chunks(worker_count_multiplier).into_iter())
-    .map(|(_index, worker_senders)| {
-        let rx = rx.clone();
+    .map(|((_index, collector_sender), worker_senders)| {
+        let rx = Arc::clone(&rx);
         let mut sender_loop = worker_senders.collect::<Vec<Sender<XmlWorkload>>>().into_iter().cycle();
-        let cloned_descriptors = descriptors.clone();
         let cloned_error_sender = error_sender.clone();
+        let cloned_counter = Arc::clone(&global_file_id_seq);
         readers_runtime.spawn(async move {
             loop {
                 // let sent_descriptor = Arc::clone(&self)
@@ -126,13 +151,16 @@ where
                         match item {
                             Some(FileInfo {
                                 filename,
+                                descriptors,
                                 stream_factory
                             }) => {
                                 match read(
+                                cloned_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                                 &filename,
                                 stream_factory(),
-                                &cloned_descriptors,
+                                descriptors,
                                 &current_sender,
+                                &collector_sender,
                                 &cloned_error_sender,
                                 reader_highwatermark
                             ).await {
