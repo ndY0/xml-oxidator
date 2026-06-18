@@ -1,4 +1,4 @@
-use std::{cell::BorrowError, collections::HashMap, error::Error, fmt::Display, ops::AddAssign, sync::Arc};
+use std::{cell::BorrowError, collections::HashMap, error::Error, fmt::Display, ops::AddAssign, sync::{Arc, atomic::AtomicU8}};
 use tokio::{io::{AsyncRead, BufReader}, sync::{Mutex, mpsc::{Receiver, Sender, channel, error::SendError}}};
 use quick_xml::{Error as XmlError, Reader, events::{BytesStart, Event}};
 
@@ -13,6 +13,7 @@ pub struct TechnicalError {
 #[derive(Debug)]
 pub struct XmlWorkload {
     pub file_id: u64,
+    pub workload_counter: u8,
     pub file: String,
     pub tag: String,
     pub path: Vec<Path>,
@@ -127,6 +128,7 @@ pub async fn read<S>(
 where
     S: AsyncRead + Unpin,
 {
+    let workload_counter_seq = Arc::new(AtomicU8::new(0));
     let reader_context: Mutex<ReaderContext> = Mutex::new(ReaderContext::new(descriptors.get_root().ok_or(FileReaderError("empty descriptors".into()))?));
     let reader = BufReader::new(src);
     let mut reader = Reader::from_reader(reader);
@@ -153,6 +155,7 @@ where
                             handle_path_match(
                                 file_id,
                                 file,
+                                Arc::clone(&workload_counter_seq),
                                 tag,
                                 &mut reader_context,
                                 sender,
@@ -169,6 +172,7 @@ where
                                     handle_path_match(
                                         file_id,
                                         file,
+                                        Arc::clone(&workload_counter_seq),
                                         tag,
                                         &mut reader_context,
                                         sender,
@@ -204,7 +208,6 @@ where
                         reader_context.ignore_path.pop();
                     },
                     ReaderState::Reading => {
-                        // TODO
                         // if we are reading, we need to send the upppermost view in construction
                         match reader_context.current_view.pop() {
                             Some(view) => {
@@ -233,12 +236,12 @@ where
             },
             Event::Eof => {
                 // we need to send the termination of file to the collector so that it can emit the diagnostic
-                match collector_sender.send(FileResult::Terminated(file_id, file.into())).await {
+                match collector_sender.send(FileResult::Terminated(file_id, file.into(), workload_counter_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed))).await {
                     Ok(_) => {},
                     Err(err) => {
                         match &err.0 {
-                            FileResult::Progress(_, file_name, _) |
-                            FileResult::Terminated(_, file_name) => {
+                            FileResult::Progress(_, file_name, _, _) |
+                            FileResult::Terminated(_, file_name, _) => {
                                 error_sender.send(TechnicalError {
                                     error: err.to_string(),
                                     file: file_name.to_string()
@@ -258,6 +261,7 @@ where
 async fn handle_path_match<'a, 'b>(
     file_id: u64,
     file: &str,
+    workload_id_seq: Arc<AtomicU8>,
     tag: BytesStart<'_>,
     reader_context: &'b mut ReaderContext<'a>,
     sender: &Sender<XmlWorkload>,
@@ -269,13 +273,14 @@ async fn handle_path_match<'a, 'b>(
     // as long as the path
     let path = reader_context.current_descriptor.path().clone();
     reader_context.current_path.push(path);
-    if !reader_context.element_senders.contains_key(&*reader_context.current_path) {
+    if !reader_context.element_senders.contains_key(&reader_context.current_path) {
         // creating the channel
         let (tx, rx) = channel::<NodeView>(highwatermark);
         //send the worload, including the event receiver
         match sender.send(
             XmlWorkload {
                 file_id,
+                workload_counter: workload_id_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 file: file.to_string(),
                 path: reader_context.current_path.clone(),
                 tag: String::from_utf8_lossy(tag.name().into_inner()).to_string(),
@@ -298,7 +303,7 @@ async fn handle_path_match<'a, 'b>(
         let path = reader_context.current_path.clone();
         reader_context.element_senders.insert(path, (tx, PathIndex(0)));
     } else {
-        reader_context.current_path.pop();
+        // reader_context.current_path.pop();
         // if there is already one, it's a new element of a stream, we need to
         // increment the current index
         match reader_context.element_senders.get_mut(&reader_context.current_path) {

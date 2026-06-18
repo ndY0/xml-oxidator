@@ -1,4 +1,5 @@
 use std::{fmt::Display, sync::{Arc, atomic::AtomicU64}};
+use educe::Educe;
 use futures::future::join_all;
 use itertools::Itertools;
 use tokio::{io::AsyncRead, runtime::Builder, sync::{Mutex, mpsc::{self, Receiver, Sender}}, task::JoinHandle};
@@ -21,12 +22,15 @@ impl From<IoError> for ValidatorError {
     }
 }
 
+#[derive(Educe)]
+#[educe(Debug)]
 pub struct FileInfo<S>
 where
     S: AsyncRead + Unpin
 {
     filename: String,
     descriptors: Arc<Tree>,
+    #[educe(Debug(ignore))]
     stream_factory: Box<dyn FnOnce() -> S + Send>
 
 }
@@ -56,8 +60,9 @@ pub async fn start<S>(
     reader_count: usize,
     worker_count_multiplier: usize,
     worker_queue_size: usize,
-    collector_queue_size: usize,
-    reader_highwatermark: usize
+    worker_task_multiplier: usize,
+    view_queue_size: usize,
+    collector_queue_size: usize
 ) -> Result<(), ValidatorError>
 where
     S: AsyncRead + Unpin + Send + 'static
@@ -113,16 +118,16 @@ where
     ): (
         Vec<Sender<XmlWorkload>>,
         Vec<Receiver<XmlWorkload>>
-    ) = (1..=worker_count_multiplier * reader_count)
+    ) = (1..=worker_count_multiplier * reader_count * worker_task_multiplier)
     .map(|_| mpsc::channel::<XmlWorkload>(worker_queue_size))
     .unzip();
     let worker_handles: Vec<JoinHandle<()>> = worker_receivers.into_iter()
     // we want a uniform distribution, so we are cycling iterator, and capping it
-    .zip(collector_senders.clone().into_iter().cycle().take(worker_count_multiplier * reader_count))
+    .zip(collector_senders.clone().into_iter().cycle().take(worker_count_multiplier * reader_count * worker_task_multiplier))
     .map(|(mut rx, sender)| {
         workers_runtime.spawn( async move {
             loop {
-                match consume_xml_workload(&mut rx, &sender).await {
+                match consume_xml_workload(&mut rx, &sender, view_queue_size).await {
                     Ok(()) => {},
                     Err(err) => {
                         println!("an error occured : {:?}", err)
@@ -162,7 +167,7 @@ where
                                 &current_sender,
                                 &collector_sender,
                                 &cloned_error_sender,
-                                reader_highwatermark
+                                view_queue_size
                             ).await {
                                    Ok(()) => {},
                                     Err(err) => { println!("an error occured : {:?}", err) } 

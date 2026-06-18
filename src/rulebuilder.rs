@@ -267,7 +267,7 @@ impl <P: NodeHandler> Child<InitState, P> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Tree {
     pub nodes: Vec<Node>
 }

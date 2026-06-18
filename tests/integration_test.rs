@@ -61,10 +61,11 @@ async fn test_small_simple_file() {
             &error_sender,
             &diagnostic_sender,
             1,
-            2,
+        2,
             10,
             10,
-            2
+            10,
+            10
         ).await {
             Ok(_) => {
     

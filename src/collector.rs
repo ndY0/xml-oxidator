@@ -33,8 +33,8 @@ pub struct RuleDiagnostic {
     pub comment: String
 }
 
-impl From<(String, Vec<RuleResult>)> for FullDiagnostic {
-    fn from((file_name, rule_results): (String, Vec<RuleResult>)) -> Self {
+impl From<(String, &mut Vec<RuleResult>)> for FullDiagnostic {
+    fn from((file_name, rule_results): (String, &mut Vec<RuleResult>)) -> Self {
         FullDiagnostic {
             filename: file_name,
             diagnotics: rule_results.iter()
@@ -55,52 +55,101 @@ pub async fn collect_results(
     diagnostic_sender: &Sender<FullDiagnostic>,
     error_sender: &Sender<TechnicalError>,
 ) -> Result<(), CollectorError> {
-    let results: Mutex<HashMap<u64, (String, Vec<RuleResult>)>> = Mutex::new(HashMap::new());
+    let results: Mutex<HashMap<u64, (String, Option<u8>, Vec<u8>, Vec<RuleResult>)>> = Mutex::new(HashMap::new());
     while let Some(file_results) = collector_receiver.recv().await {
         let mut results = results.lock().await;
         match file_results {
-            FileResult::Progress(file_id, file_name, mut rule_results) => {
-                dbg!(&rule_results);
+            FileResult::Progress(file_id, file_name, workload_counter, mut rule_results) => {
+                let mut completed = false;
+                dbg!(workload_counter);
                 match results.get_mut(&file_id) {
-                    Some((_file_name, file_rule_results)) => {
+                    Some((_file_name, total_workload_count, workload_counters, file_rule_results)) => {
                         file_rule_results.append(&mut rule_results);
+                        workload_counters.push(workload_counter);
+                        workload_counters.sort();
+                        completed = check_completion(
+                            diagnostic_sender,
+                            error_sender,
+                            file_id,
+                            file_name,
+                            file_rule_results,
+                            workload_counters,
+                            total_workload_count
+                        ).await?;
                     },
                     None => {
                         let mut file_rule_results: Vec<RuleResult> = Vec::new();
+                        let mut workload_counters: Vec<u8> = Vec::new();
                         file_rule_results.append(&mut rule_results);
-                        results.insert(file_id, (file_name, file_rule_results));
+                        workload_counters.push(workload_counter);
+                        results.insert(file_id, (file_name, None, workload_counters, file_rule_results));
                     }
                 }
+                if completed {
+                    results.remove(&file_id);
+                }
             },
-            FileResult::Terminated(file_id, file_name) => {
-                dbg!(&file_name);
-                // TODO: add a counter for payload tracking and actual completion
-                // match results.remove(&file_id) {
-                //     Some((file_name, file_rule_results)) => {
-                //         match diagnostic_sender.send((file_name, file_rule_results).into()).await {
-                //             Ok(_) => {},
-                //             Err(err) => {
-                //                 error_sender.send(TechnicalError {
-                //                     error: err.to_string(),
-                //                     file: file_id.to_string()
-                //                 }).await?
-                //             }
-                //         }
-                //     },
-                //     None => {
-                //         match diagnostic_sender.send((file_name, vec![]).into()).await {
-                //             Ok(_) => {},
-                //             Err(err) => {
-                //                 error_sender.send(TechnicalError {
-                //                     error: err.to_string(),
-                //                     file: file_id.to_string()
-                //                 }).await?
-                //             }
-                //         }
-                //     }
-                // }
+            FileResult::Terminated(file_id, file_name, total_workload_count_received) => {
+                let mut completed = false;
+                
+                match results.get_mut(&file_id) {
+                    None => {
+                        let file_rule_results: Vec<RuleResult> = Vec::new();
+                        let workload_counters: Vec<u8> = Vec::new();
+                        results.insert(file_id, (file_name, Some(total_workload_count_received), workload_counters, file_rule_results));
+                    },
+                    Some((_file_name, total_workload_count, workload_counters, file_rule_results)) => {
+                        total_workload_count.replace(total_workload_count_received);
+                        completed = check_completion(
+                            diagnostic_sender,
+                            error_sender,
+                            file_id,
+                            file_name,
+                            file_rule_results,
+                            workload_counters,
+                            total_workload_count
+                        ).await?;
+                    }
+                }
+                if completed {
+                    results.remove(&file_id);
+                }
             }
         }
     }
     Ok(())
+}
+
+pub async fn check_completion(
+    diagnostic_sender: &Sender<FullDiagnostic>,
+    error_sender: &Sender<TechnicalError>,
+    file_id: u64,
+    file_name: String,
+    results: &mut Vec<RuleResult>,
+    workload_counters: &mut Vec<u8>,
+    total_workload_count: &mut Option<u8>,
+
+) -> Result<bool, CollectorError> {
+    let completed = total_workload_count
+    .is_some_and(
+        |total| workload_counters
+        .get(workload_counters.len() - 1)
+        .is_some_and(|max| *max == total)
+    )
+    && workload_counters.iter().zip(0u8..=(workload_counters.len() as u8 - 1))
+    .fold(true, |acc, (count, cmp)| acc && *count == cmp);
+
+    if completed {
+        match diagnostic_sender.send((file_name, results).into()).await {
+            Ok(_) => {},
+            Err(err) => {
+                error_sender.send(TechnicalError {
+                    error: err.to_string(),
+                    file: file_id.to_string()
+                }).await?
+            }
+        }
+    }
+
+    Ok(completed)
 }
