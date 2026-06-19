@@ -67,6 +67,11 @@ pub async fn start<S>(
 where
     S: AsyncRead + Unpin + Send + 'static
 {
+
+    // in order to prevent deadlocks, we need to track the work effectively done by the system.
+    // this take the shape of a node received work counter, incremented each time a view is taken into account.
+    let progress = Arc::new(AtomicU64::new(0));
+
     let global_file_id_seq = Arc::new(AtomicU64::new(0));
     let readers_runtime: tokio::runtime::Runtime = Builder::new_multi_thread()
     .worker_threads(reader_count)
@@ -76,6 +81,7 @@ where
 
     let workers_runtime = tokio::runtime::Builder::new_multi_thread()
     .worker_threads(worker_count_multiplier * reader_count)
+    .enable_time()
     .thread_name("rule-pool")
     .build()?;
 
@@ -110,7 +116,6 @@ where
             }
         })
     }).collect();
-
     // rule workers setup
     let (
         worker_senders,
@@ -125,13 +130,12 @@ where
     // we want a uniform distribution, so we are cycling iterator, and capping it
     .zip(collector_senders.clone().into_iter().cycle().take(worker_count_multiplier * reader_count * worker_task_multiplier))
     .map(|(mut rx, sender)| {
+        let cloned_progress = Arc::clone(&progress);
         workers_runtime.spawn( async move {
-            loop {
-                match consume_xml_workload(&mut rx, &sender, view_queue_size).await {
-                    Ok(()) => {},
-                    Err(err) => {
-                        println!("an error occured : {:?}", err)
-                    }
+            match consume_xml_workload(&mut rx, Arc::new(sender), cloned_progress, view_queue_size).await {
+                Ok(()) => {},
+                Err(err) => {
+                    println!("an error occured : {:?}", err)
                 }
             }
         })
@@ -141,7 +145,7 @@ where
     let rx = Arc::new(Mutex::new(file_receiver));
     let reader_handles: Vec<JoinHandle<()>> = (1..=reader_count)
     .zip(collector_senders.into_iter())
-    .zip(worker_senders.into_iter().chunks(worker_count_multiplier).into_iter())
+    .zip(worker_senders.into_iter().chunks(worker_count_multiplier * worker_count_multiplier).into_iter())
     .map(|((_index, collector_sender), worker_senders)| {
         let rx = Arc::clone(&rx);
         let mut sender_loop = worker_senders.collect::<Vec<Sender<XmlWorkload>>>().into_iter().cycle();

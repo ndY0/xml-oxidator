@@ -26,8 +26,6 @@ pub trait NodeBuilder {
     fn build(self) -> Self::BuildOutput;
 }
 
-// pub type PropertyMapper = Box<dyn Fn(&NodeView, &mut HashMap<String, String>)-> () + Send + Sync>;
-
 pub trait PropertyMapper
 where
     Self: Sync + Send + DynClonePropertyMapper + Debug
@@ -58,7 +56,7 @@ pub trait Rule
     where Self: Sync + Send + DynCloneRule + Debug
 {
     fn fold(&mut self, view: &NodeView, ctx: &HashMap<String, String>);
-    fn assert(&self) -> Diagnostic;
+    fn assert(&self, path: &str) -> Diagnostic;
 }
 
 // intermediate trait, necessary for the blanket impl
@@ -480,7 +478,7 @@ where
     Acc: Debug + Sync + Send + Clone + 'static,
     R: Clone + 'static
 {
-    pub fn build(&self, assertion: &str) -> Box<dyn Rule> {
+    pub fn build(&self, assertion: &'static str) -> Box<dyn Rule> {
         Box::new(
             ConcreteRule::new(
                 self.name.clone(),
@@ -488,7 +486,7 @@ where
                 Arc::clone(&self.test),
                 Arc::clone(&self.fold),
                 Arc::clone(&self.assert),
-                assertion.into()
+                assertion
             )
         )
     }
@@ -505,7 +503,7 @@ pub struct ConcreteRule<Acc: Send + Debug + 'static, R: 'static> {
     fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
     #[educe(Debug(ignore))]
     assert: Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
-    assertion: String
+    assertion: &'static str
 }
 
 impl <Acc: Debug + Send + 'static, R: 'static> ConcreteRule<Acc, R> {
@@ -515,7 +513,7 @@ impl <Acc: Debug + Send + 'static, R: 'static> ConcreteRule<Acc, R> {
         test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
         fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
         assert: Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
-        assertion: String, 
+        assertion: &'static str, 
     ) -> Self {
         Self {
             name,
@@ -538,10 +536,10 @@ impl <Acc, R> Rule for ConcreteRule<Acc, R>
         self.state = (self.fold)(&self.state, (self.test)(view, ctx))
     }
 
-    fn assert(&self) -> Diagnostic {
+    fn assert(&self, path: &str) -> Diagnostic {
         Diagnostic {
             rule_name: self.name.clone(),
-            assertion: self.assertion.clone(),
+            assertion: substitute(self.assertion, path, &self.name),
             statut: (self.assert)(&self.state)
         }
     }
@@ -555,14 +553,16 @@ pub struct Diagnostic {
 
 #[derive(Debug)]
 pub struct NodeView {
+    index: usize,
     text: Option<String>,
     attrs: HashMap<String, String>
 }
 
 impl NodeView {
 
-    pub fn new(attrs: HashMap<String, String>) -> Self {
+    pub fn new(attrs: HashMap<String, String>, index: usize) -> Self {
         Self {
+            index,
             attrs,
             text: None
 
@@ -578,6 +578,10 @@ impl NodeView {
     pub fn attr(&self, key: &str) -> Option<&String> {
         self.attrs.get(key)
     }
+
+    pub fn index(&self) -> usize {
+        self.index
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
@@ -587,4 +591,10 @@ impl ToString for Path {
     fn to_string(&self) -> String {
         self.0.clone()
     }
+}
+
+fn substitute(template: &str, path: &str, rule: &str) -> String {
+    template
+        .replace("{path}", path)
+        .replace("{rule}", rule)
 }

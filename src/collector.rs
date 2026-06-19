@@ -61,7 +61,6 @@ pub async fn collect_results(
         match file_results {
             FileResult::Progress(file_id, file_name, workload_counter, mut rule_results) => {
                 let mut completed = false;
-                dbg!(workload_counter);
                 match results.get_mut(&file_id) {
                     Some((_file_name, total_workload_count, workload_counters, file_rule_results)) => {
                         file_rule_results.append(&mut rule_results);
@@ -99,7 +98,7 @@ pub async fn collect_results(
                         results.insert(file_id, (file_name, Some(total_workload_count_received), workload_counters, file_rule_results));
                     },
                     Some((_file_name, total_workload_count, workload_counters, file_rule_results)) => {
-                        total_workload_count.replace(total_workload_count_received);
+                        total_workload_count.replace(total_workload_count_received.clone());
                         completed = check_completion(
                             diagnostic_sender,
                             error_sender,

@@ -34,7 +34,13 @@ impl AddAssign<u32> for PathIndex {
     fn add_assign(&mut self, rhs: u32) {
         self.0 += rhs;
     }
-} 
+}
+
+impl From<&PathIndex> for usize {
+    fn from(value: &PathIndex) -> Self {
+        value.0 as usize
+    }
+}
 
 #[derive(Debug)]
 pub struct ReaderContext<'a> {
@@ -236,7 +242,7 @@ where
             },
             Event::Eof => {
                 // we need to send the termination of file to the collector so that it can emit the diagnostic
-                match collector_sender.send(FileResult::Terminated(file_id, file.into(), workload_counter_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed))).await {
+                match collector_sender.send(FileResult::Terminated(file_id, file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
                     Ok(_) => {},
                     Err(err) => {
                         match &err.0 {
@@ -328,6 +334,13 @@ async fn handle_path_match<'a, 'b>(
             Err(_e) => {}
         };
     }
-    reader_context.current_view.push(NodeView::new(attrs));
+    match reader_context.element_senders.get(&reader_context.current_path) {
+            Some((_, index)) => {
+                reader_context.current_view.push(NodeView::new(attrs, index.into()));
+            },
+            None => {
+                reader_context.current_view.push(NodeView::new(attrs, 0));
+            }
+        }
     Ok(())
 }

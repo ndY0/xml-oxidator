@@ -1,102 +1,282 @@
-use std::{sync::Arc, time::Duration};
-use tokio::sync::mpsc::channel;
-use tokio_test::io::{Builder, Mock};
 
-use xml_oxydizer::{init::{FileInfo, start}, rulebuilder::{NodeBuilder, Path, Root, RuleBuilder, Tree}};
+#[cfg(test)]
+mod tests {
 
-fn build_simple_descriptors() -> Tree {
-    Root::new("root")
-    .add_rule(
-        RuleBuilder::test(
-            "test_rule".into(),
-            Arc::new(|view, _ctx| { view.attr("test").is_some_and(|value| {value == "value"}) })
-        )
-        .fold(Arc::new(|acc, curr| {*acc || curr}))
-        .init(Box::new(|| {false}))
-        .assert(Arc::new(|acc| {*acc}))
-        .build("root \"test\" attribute is not of value \"value\"")
-    )
-    .path(Path("child".into()), None)
+
+
+    use std::{sync::Arc};
+    use tokio::{spawn, sync::mpsc::channel};
+    use tokio_test::io::{Builder, Mock};
+    use std::time::Instant;
+    #[cfg(feature = "test-heap")]
+    use dhat::Alloc;
+    
+    use xml_oxydizer::{init::{FileInfo, start}, rulebuilder::{NodeBuilder, Path, Root, RuleBuilder, Tree}};
+
+    #[cfg(feature = "test-heap")]
+    #[global_allocator]
+    static ALLOC: Alloc = Alloc;
+
+    fn build_simple_descriptors() -> Tree {
+        Root::new("root")
         .add_rule(
             RuleBuilder::test(
-                "test_child".into(),
-                Arc::new(|view, _ctx| { view.attr("test2").is_some_and(|value| {value == "value2"}) })
+                "test_rule".into(),
+                Arc::new(|view, _ctx| { view.attr("test").is_some_and(|value| {value == "value"}) })
             )
             .fold(Arc::new(|acc, curr| {*acc || curr}))
             .init(Box::new(|| {false}))
             .assert(Arc::new(|acc| {*acc}))
-            .build("root \"test2\" attribute is not of value \"value2\"")
+            .build("root \"test\" attribute is not of value \"value\", rule=[{rule}], path=[{path}]")
         )
+        .path(Path("child".into()), None)
+            .add_rule(
+                RuleBuilder::test(
+                    "test_child".into(),
+                    Arc::new(|view, _ctx| { view.attr("test2").is_some_and(|value| {value == "value2"}) })
+                )
+                .fold(Arc::new(|acc, curr| {*acc || curr}))
+                .init(Box::new(|| {false}))
+                .assert(Arc::new(|acc| {*acc}))
+                .build("root \"test2\" attribute is not of value \"value2\", rule=[{rule}], path=[{path}]")
+            )
+            .build()
         .build()
-    .build()
-    .unwrap()
-}
-
-fn build_simple_async_xml_reader() -> Mock {
-    let mut builder = Builder::new();
-    builder
-    .read(b"<root test=\"vaue\">content root");
-
-    for _ in 1..=10_000 {
-        builder
-        .read(b"<child test2=\"value2\">")
-        .read(b"</child>");
+        .unwrap()
     }
-    builder.read(b"</root>");
-    builder.build()
-}
-
-#[tokio::test]
-async fn test_small_simple_file() {
-
-    let (file_sender, file_receiver) = channel::<FileInfo<Mock>>(1);
-    let (error_sender, mut error_receiver) = channel(1);
-    let (diagnostic_sender, mut diagnostic_receiver) = channel(1);
-
-    let descriptors = Arc::new(build_simple_descriptors());
-
-    let test_handler = tokio::spawn(async move {
-        match start(
-            file_receiver,
-            &error_sender,
-            &diagnostic_sender,
-            1,
-        2,
-            10,
-            10,
-            10,
-            10
-        ).await {
-            Ok(_) => {
     
-            },
-            Err(err) => {}
-        };
-    });
-    // we send the file
-    match file_sender.send(
-        FileInfo::new(
-            "test.xml",
-            Arc::clone(&descriptors),
-            Box::new(|| {
-                build_simple_async_xml_reader()
-            })
+    fn build_simple_async_xml_reader() -> Mock {
+        let mut builder = Builder::new();
+        builder
+        .read(b"<root test=\"vaue\">content root");
+    
+        for _ in 1..=10_000 {
+            builder
+            .read(b"<child test2=\"value2\">")
+            .read(b"</child>");
+        }
+        builder.read(b"</root>");
+        builder.build()
+    }
+
+    fn build_simple_descriptors_depeer() -> Tree {
+        Root::new("root")
+        .add_rule(
+            RuleBuilder::test(
+                "test_rule".into(),
+                Arc::new(|view, _ctx| { view.attr("test").is_some_and(|value| {value == "value"}) })
+            )
+            .fold(Arc::new(|acc, curr| {*acc || curr}))
+            .init(Box::new(|| {false}))
+            .assert(Arc::new(|acc| {*acc}))
+            .build("root \"test\" attribute is not of value \"value\", rule=[{rule}], path=[{path}]")
         )
-    ).await {
-        Ok(_) => {
+        .path(Path("child".into()), None)
+            .add_rule(
+                RuleBuilder::test(
+                    "test_child".into(),
+                    Arc::new(|view, _ctx| { view.attr("test2").is_some_and(|value| {value == "value2"}) })
+                )
+                .fold(Arc::new(|acc, curr| {*acc || curr}))
+                .init(Box::new(|| {false}))
+                .assert(Arc::new(|acc| {*acc}))
+                .build("child \"test2\" attribute is not of value \"value2\", rule=[{rule}], path=[{path}]")
+            )
+            .path(Path("nested".into()), None)
+                .add_rule(
+                    RuleBuilder::test(
+                        "test_nested".into(),
+                        Arc::new(|view, _ctx| { view.attr("test2").is_some_and(|value| {value == "value2"}) })
+                    )
+                    .fold(Arc::new(|acc, curr| {*acc || curr}))
+                    .init(Box::new(|| {false}))
+                    .assert(Arc::new(|acc| {*acc}))
+                    .build("nested \"test2\" attribute is not of value \"value2\", rule=[{rule}], path=[{path}]")
+                )
+                .path(Path("nested".into()), None)
+                    .add_rule(
+                        RuleBuilder::test(
+                            "test_nested".into(),
+                            Arc::new(|view, _ctx| { view.attr("test2").is_some_and(|value| {value == "value2"}) })
+                        )
+                        .fold(Arc::new(|acc, curr| {*acc || curr}))
+                        .init(Box::new(|| {false}))
+                        .assert(Arc::new(|acc| {*acc}))
+                        .build("nested \"test2\" attribute is not of value \"value2\", rule=[{rule}], path=[{path}]")
+                    )
+                    .path(Path("nested".into()), None)
+                        .add_rule(
+                            RuleBuilder::test(
+                                "test_nested".into(),
+                                Arc::new(|view, _ctx| { view.attr("test2").is_some_and(|value| {value == "value2"}) })
+                            )
+                            .fold(Arc::new(|acc, curr| {*acc || curr}))
+                            .init(Box::new(|| {false}))
+                            .assert(Arc::new(|acc| {*acc}))
+                            .build("nested \"test2\" attribute is not of value \"value2\", rule=[{rule}], path=[{path}]")
+                        )
+                        .build()
+                    .build()
+                .build()
+            .build()
+        .build()
+        .unwrap()
+    }
 
-        },
-        Err(err) => {
-
+    fn build_simple_nested_async_xml_reader() -> Mock {
+        let mut builder = Builder::new();
+        builder
+        .read(b"<root test=\"vaue\">content root");
+    
+        for _ in 1..=10_000 {
+            builder
+            .read(b"<child test2=\"value2\">")
+            .read(b"<nested test2=\"value2\">")
+            .read(b"<nested test2=\"value2\">")
+            .read(b"<nested test2=\"value2\">")
+            .read(b"</nested>")
+            .read(b"</nested>")
+            .read(b"</nested>")
+            .read(b"</child>");
         }
-    };
-    match diagnostic_receiver.recv().await {
-        Some(data) => {
-            println!("received data : {:?}", data);
-        },
-        None => {
+        builder.read(b"</root>");
+        builder.build()
+    }
+    
+    #[tokio::test]
+    async fn test_small_simple_file() {
 
+        #[cfg(feature = "test-heap")]
+        let _profiler = dhat::Profiler::new_heap();
+    
+        let (file_sender, file_receiver) = channel::<FileInfo<Mock>>(1);
+        let (error_sender, mut error_receiver) = channel(1);
+        let (diagnostic_sender, mut diagnostic_receiver) = channel(1);
+    
+        let descriptors = Arc::new(build_simple_descriptors());
+    
+        let test_handler = tokio::spawn(async move {
+            match start(
+                file_receiver,
+                &error_sender,
+                &diagnostic_sender,
+                1,
+            2,
+                10,
+                2,
+                10,
+                10
+            ).await {
+                Ok(_) => {
+        
+                },
+                Err(err) => {
+    
+                }
+            };
+        });
+        // start of the actual payload
+        spawn(async move {
+            match file_sender.send(
+                FileInfo::new(
+                    "test.xml",
+                    Arc::clone(&descriptors),
+                    Box::new(|| {
+                        build_simple_async_xml_reader()
+                    })
+                )
+            ).await {
+                Ok(_) => {
+        
+                },
+                Err(err) => {
+        
+                }
+            };
+        });
+        let start = Instant::now();
+        // we send the file
+        match diagnostic_receiver.recv().await {
+            Some(data) => {
+                println!("received data : {:?}", data);
+            },
+            None => {
+    
+            }
         }
+        // end of treatment
+        println!("test duration : {:?}", start.elapsed())
+    
+    }
+
+    #[tokio::test]
+    async fn test_small_simple_file_deadlock() {
+
+        #[cfg(feature = "test-heap")]
+        let _profiler = dhat::Profiler::new_heap();
+    
+        let (file_sender, file_receiver) = channel::<FileInfo<Mock>>(1);
+        let (error_sender, mut error_receiver) = channel(1);
+        let (diagnostic_sender, mut diagnostic_receiver) = channel(1);
+    
+        let descriptors = Arc::new(build_simple_descriptors_depeer());
+    
+        let test_handler = tokio::spawn(async move {
+            match start(
+                file_receiver,
+                &error_sender,
+                &diagnostic_sender,
+                2,
+            1,
+                1,
+                1,
+                1,
+                1
+            ).await {
+                Ok(_) => {
+        
+                },
+                Err(err) => {
+    
+                }
+            };
+        });
+        // start of the actual payload
+        spawn(async move {
+            for _ in 1..=10 {
+                match file_sender.send(
+                    FileInfo::new(
+                        "test.xml",
+                        Arc::clone(&descriptors),
+                        Box::new(|| {
+                            build_simple_nested_async_xml_reader()
+                        })
+                    )
+                ).await {
+                    Ok(_) => {
+            
+                    },
+                    Err(err) => {
+            
+                    }
+                };
+            }
+        });
+        let start = Instant::now();
+        // we send the file
+        for _ in 1..=10 {
+            match diagnostic_receiver.recv().await {
+                Some(data) => {
+                    println!("received data : {:?}", data);
+                },
+                None => {
+        
+                }
+            }
+        }
+        // end of treatment
+        println!("test duration : {:?}", start.elapsed())
+    
     }
 
 }
