@@ -30,11 +30,11 @@
 
     ROADMAP:
         - convert fold to an FnAsync, so we can manipulate tokio receivers inside
-        - convert the NodeView text field from Option<String> to Receiver<Option<String>>
+        - convert the NodeView text field from Option<String> to Receiver<String>
         - transform NodeView to Enum, with two flavours :
             - FullNodeView : attr, text receiver and children receivers. text receiver is broadcast
             - PartialNodeView : attr and text receiver only. text receiver is broadcast
-        - add a children prop to FullNodeView, wich will be of type HashMap<Vec<Path>, Option<Receiver<PartialNodeView>>>. receiver is broadcast
+        - add a children prop to FullNodeView, wich will be of type HashMap<Vec<Path>, Receiver<PartialNodeView>>. receiver is broadcast
         - adapt reader to send node view immediately, and add push text if receivied, or none at closing tag
         - adapt rule builder to allow adding child subscription for a path. if path does not exists, then receiver will be dropped with no data sent.
         - adapt reader to track child subscriptions in current node stack. at each new node, scan for dependency on the stack
@@ -42,7 +42,7 @@
 # Implement the parent context
 
     ROADMAP:
-        - change context from HashMap<String, String> to HashMap<Vec<Path>, Option<PartialNodeView>>
+        - change context from HashMap<String, String> to HashMap<Vec<Path>, PartialNodeView>
         - adapt reader to add the binded partial node if descriptor says so
         - adapt rule builder to allow to bind a node partial view to the context
         - finish implementing the context consumption properly

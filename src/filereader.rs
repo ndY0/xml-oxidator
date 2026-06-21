@@ -1,8 +1,8 @@
 use std::{cell::BorrowError, collections::HashMap, error::Error, fmt::Display, ops::AddAssign, sync::{Arc, atomic::AtomicU8}};
-use tokio::{io::{AsyncRead, BufReader}, sync::{Mutex, mpsc::{Receiver, Sender, channel, error::SendError}}};
+use tokio::{io::{AsyncRead, BufReader}, sync::{Mutex, broadcast::{self, Receiver as BroadcastReceiver, Sender as BroadcastSender}, mpsc::{Receiver, Sender, channel, error::SendError}}};
 use quick_xml::{Error as XmlError, Reader, events::{BytesStart, Event}};
 
-use crate::{cancellation::ShutdownHandle, init::FatalError, rulebuilder::{Node, NodeView, Path, Rule, Tree}, xmlworker::FileResult};
+use crate::{cancellation::ShutdownHandle, init::FatalError, rulebuilder::{FullNodeView, Node, NodeView, PartialNodeView, Path, Rule, Tree}, xmlworker::FileResult};
 
 #[derive(Debug)]
 pub struct TechnicalError {
@@ -18,7 +18,7 @@ pub struct XmlWorkload {
     pub tag: String,
     pub path: Vec<Path>,
     pub rules: Vec<Box<dyn Rule>>,
-    pub events: Receiver<NodeView>
+    pub events: Receiver<FullNodeView>
 }
 
 #[derive(Debug)]
@@ -43,13 +43,27 @@ impl From<&PathIndex> for usize {
 }
 
 #[derive(Debug)]
-pub struct ReaderContext<'a> {
-    current_path: Vec<Path>,
-    mode: ReaderState,
-    ignore_path: Vec<Path>,
-    element_senders: HashMap<Vec<Path>, (Sender<NodeView>, PathIndex)>,
-    current_descriptor: &'a Node,
-    current_view: Vec<NodeView>
+struct SenderContext {
+    pub sender: Sender<FullNodeView>,
+    pub path_index: PathIndex,
+}
+
+#[derive(Debug)]
+struct CurrentViewContext {
+    pub view: Arc<FullNodeView>,
+    pub text_sender: BroadcastSender<String>,
+    pub children_sender: HashMap<Vec<Path>, BroadcastSender<PartialNodeView>>
+}
+
+#[derive(Debug)]
+struct ReaderContext<'a> {
+    pub current_path: Vec<Path>,
+    pub mode: ReaderState,
+    pub ignore_path: Vec<Path>,
+    pub element_senders: HashMap<Vec<Path>, SenderContext>,
+    pub current_descriptor: &'a Node,
+    pub current_view: Vec<CurrentViewContext>,
+    pub global_context: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>
 }
 
 impl <'a> ReaderContext<'a> {
@@ -60,7 +74,8 @@ impl <'a> ReaderContext<'a> {
             mode: ReaderState::Reading,
             ignore_path: Vec::new(),
             current_view: Vec::new(),
-            element_senders: HashMap::new()
+            element_senders: HashMap::new(),
+            global_context: Arc::new(HashMap::new())
         }
     }
 
@@ -325,8 +340,8 @@ async fn handle_reader_event<'a, 'b>(
                     match reader_context.current_view.pop() {
                         Some(view) => {
                             match reader_context.element_senders.get(&reader_context.current_path) {
-                                Some((sender, _)) => {
-                                    match sender.send(view).await {
+                                Some(SenderContext { sender, path_index }) => {
+                                    match sender.send(view.view).await {
                                         Ok(()) => {},
                                         Err(err) => {
                                             match collector_sender.send(FileResult::Aborted(
@@ -408,7 +423,7 @@ async fn handle_path_match<'a, 'b>(
     reader_context.current_path.push(path);
     if !reader_context.element_senders.contains_key(&reader_context.current_path) {
         // creating the channel
-        let (tx, rx) = channel::<NodeView>(highwatermark);
+        let (tx, rx) = channel::<FullNodeView>(highwatermark);
         //send the worload, including the event receiver
         match sender.send(
             XmlWorkload {
@@ -429,14 +444,13 @@ async fn handle_path_match<'a, 'b>(
         };
         // we then store the sender on the hashmap, as long as the current element index
         let path = reader_context.current_path.clone();
-        reader_context.element_senders.insert(path, (tx, PathIndex(0)));
+        reader_context.element_senders.insert(path, SenderContext{sender: tx, path_index: PathIndex(0)});
     } else {
-        // reader_context.current_path.pop();
         // if there is already one, it's a new element of a stream, we need to
         // increment the current index
         match reader_context.element_senders.get_mut(&reader_context.current_path) {
-            Some((_, index)) => {
-                *index += 1
+            Some(SenderContext { sender, path_index }) => {
+                *path_index += 1
             },
             None => {}
         };
@@ -457,11 +471,36 @@ async fn handle_path_match<'a, 'b>(
         };
     }
     match reader_context.element_senders.get(&reader_context.current_path) {
-        Some((_, index)) => {
-            reader_context.current_view.push(NodeView::new(attrs, index.into()));
+        Some(SenderContext { sender, path_index }) => {
+            let (text_sender, text_receiver) = broadcast::channel(highwatermark);
+            let text_receiver = Arc::new(text_receiver);
+            if reader_context.current_descriptor.map_view() {
+
+            }
+            let (sender_stack, receiver_stack): (Vec<(Vec<Path>, BroadcastSender<PartialNodeView>)>, Vec<(Vec<Path>, BroadcastReceiver<PartialNodeView>)>) = reader_context.current_descriptor.map_children().iter()
+            .map(|child| {
+                let (tx, rx) = broadcast::channel::<PartialNodeView>(highwatermark);
+                ((child.clone(), tx), (child.clone(), rx))
+            }).unzip();
+            let view = Arc::new(
+                FullNodeView::new(
+                    attrs,
+                    path_index.into(),
+                    text_receiver,
+                    Arc::new(HashMap::from_iter(receiver_stack))
+                )
+            );
+            reader_context.current_view.push(
+                CurrentViewContext {
+                    view: view.clone(),
+                    text_sender: text_sender,
+                    children_sender: HashMap::from_iter(sender_stack)
+                }
+            );
+            sender.send(view)
         },
         None => {
-            reader_context.current_view.push(NodeView::new(attrs, 0));
+            // reader_context.current_view.push(NodeView::new(attrs, 0));
         }
     }
 }

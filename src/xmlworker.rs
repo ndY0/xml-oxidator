@@ -141,7 +141,8 @@ async fn consume_payload(
             let ctx = HashMap::new();
             while let Some(view) = payload.events.recv().await {
                 for rule in payload.rules.iter_mut() {
-                    rule.fold(&view, &ctx);
+                    // TODO : since this is async code now, run it in //
+                    rule.fold(&view, &ctx).await;
                 }
             }
             let results: Vec<RuleResult> = payload.rules.iter()

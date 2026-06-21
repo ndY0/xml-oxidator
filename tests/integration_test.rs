@@ -62,7 +62,7 @@ mod tests {
         .add_rule(
             RuleBuilder::test(
                 "test_rule".into(),
-                Arc::new(|view, _ctx| { view.attr("test").is_some_and(|value| {value == "value"}) })
+                Arc::new(|view, _ctx| async move { view.attr("test").is_some_and(|value| {value == "value"}) })
             )
             .fold(Arc::new(|acc, curr| {*acc || curr}))
             .init(Box::new(|| {false}))

@@ -1,4 +1,5 @@
-use std::{cell::RefCell, collections::HashMap, fmt::Display, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, fmt::Display, pin::Pin, rc::Rc, sync::Arc};
+use tokio::sync::{Mutex, broadcast::Receiver};
 use std::fmt::Debug;
 use educe::Educe;
 
@@ -13,7 +14,7 @@ impl Display for BuilderError {
 
 pub trait NodeHandler {
     type ToBuilderOuput;
-    fn add_node(&mut self, path: Path, node: usize, map_from_parent: Option<Box<dyn PropertyMapper>>);
+    fn add_node(&mut self, path: Path, node: usize);
     fn to_builder(self) -> Self::ToBuilderOuput;
 }
 
@@ -22,40 +23,14 @@ pub trait NodeBuilder {
     type PathOutput;
     type BuildOutput;
     fn add_rule(self, rule: Box<dyn Rule>) -> Self::AddRuleOutput;
-    fn path(self, path: Path, map_from_parent: Option<Box<dyn PropertyMapper>>) -> Self::PathOutput;
+    fn path(self, path: Path, map_view: bool, map_children: Vec<Vec<Path>>) -> Self::PathOutput;
     fn build(self) -> Self::BuildOutput;
-}
-
-pub trait PropertyMapper
-where
-    Self: Sync + Send + DynClonePropertyMapper + Debug
-{
-    fn map(&self, view: &NodeView, ctx: &mut HashMap<String, String>);
-}
-
-// intermediate trait, necessary for the blanket impl
-pub trait DynClonePropertyMapper {
-    fn clone_box(&self) -> Box<dyn PropertyMapper>;
-}
-
-// blanket impl of the intermediate trait
-// it is important to restrict to Clone
-impl<T: PropertyMapper + Clone + 'static> DynClonePropertyMapper for T {
-    fn clone_box(&self) -> Box<dyn PropertyMapper> {
-        Box::new(self.clone())
-    }
-}
-
-impl Clone for Box<dyn PropertyMapper> {
-    fn clone(&self) -> Self {
-        self.clone_box()
-    }
 }
 
 pub trait Rule
     where Self: Sync + Send + DynCloneRule + Debug
 {
-    fn fold(&mut self, view: &NodeView, ctx: &HashMap<String, String>);
+    fn fold(&mut self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + '_>>;
     fn assert(&self, path: &str) -> Diagnostic;
 }
 
@@ -85,14 +60,16 @@ pub struct Root<State> {
     _state: std::marker::PhantomData<State>,
     tree: Rc<RefCell<Tree>>,
     path: Path,
-    nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>,
+    map_view: bool,
+    map_children: Vec<Vec<Path>>,
+    nodes: HashMap<Path, usize>,
     rules: Vec<Box<dyn Rule>>
 }
 
-impl <'a> NodeHandler for Root<NodeAdderState> {
+impl NodeHandler for Root<NodeAdderState> {
     type ToBuilderOuput = Root<InitState>;
-    fn add_node(&mut self, path: Path, node: usize, map_from_parent: Option<Box<dyn PropertyMapper>>) {
-        self.nodes.insert(path, (node, map_from_parent));
+    fn add_node(&mut self, path: Path, node: usize) {
+        self.nodes.insert(path, node);
     }
     fn to_builder(self) -> Self::ToBuilderOuput {
         Root {
@@ -100,6 +77,8 @@ impl <'a> NodeHandler for Root<NodeAdderState> {
             tree: self.tree,
             nodes: self.nodes,
             path: self.path,
+            map_view: self.map_view,
+            map_children: self.map_children,
             rules: self.rules
         }
     }
@@ -117,15 +96,17 @@ impl NodeBuilder for Root<InitState> {
         self
     }
 
-    fn path(self, path: Path, map_from_parent: Option<Box<dyn PropertyMapper>>) -> Self::PathOutput {
+    fn path(self, path: Path, map_view: bool, map_children: Vec<Vec<Path>>) -> Self::PathOutput {
         let build_parent: Root<NodeAdderState> = Root {
             _state: std::marker::PhantomData,
             tree: Rc::clone(&self.tree),
             nodes: self.nodes,
             path: self.path,
+            map_view: self.map_view,
+            map_children: self.map_children,
             rules: self.rules
         };
-        Child::new(build_parent, Rc::clone(&self.tree), path, map_from_parent)
+        Child::new(build_parent, Rc::clone(&self.tree), path, map_view, map_children)
     }
 
     fn build(self) -> Self::BuildOutput {
@@ -133,14 +114,16 @@ impl NodeBuilder for Root<InitState> {
         // we create the parent node
         let mut parent = Node::new(
             self.path,
-            self.rules
+            self.rules,
+            self.map_view,
+            self.map_children
         );
         match Rc::try_unwrap(self.tree) {
             Ok(tree) => {
                 let mut tree = tree.into_inner();
                 // for every child it declare, we must set it's parent with the help of the tree
                 let parent_index = tree.next_index();
-                for (_1, (node, _2)) in &self.nodes {
+                for (_1, node) in &self.nodes {
                     tree.set_child_parent(*node, parent_index);
                 }
                 parent.set_nodes(self.nodes);
@@ -156,12 +139,14 @@ impl NodeBuilder for Root<InitState> {
 }
 
 impl Root<InitState> {
-    pub fn new(root: &str) -> Self {
+    pub fn new(root: &str, map_view: bool, map_children: Vec<Vec<Path>>) -> Self {
         Self {
             _state: std::marker::PhantomData,
             tree: Rc::new(RefCell::new(Tree::new())),
             path: Path(root.into()),
             nodes: HashMap::new(),
+            map_view,
+            map_children,
             rules: Vec::new()
         }
     }
@@ -170,10 +155,11 @@ impl Root<InitState> {
 pub struct Child<State, Parent> {
     _state: std::marker::PhantomData<State>,
     tree: Rc<RefCell<Tree>>,
-    map_from_parent: Option<Box<dyn PropertyMapper>>,
+    map_view: bool,
+    map_children: Vec<Vec<Path>>,
     parent: Parent,
     path: Path,
-    nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>,
+    nodes: HashMap<Path, usize>,
     rules: Vec<Box<dyn Rule>>
 }
 
@@ -181,8 +167,8 @@ impl <P: NodeHandler> NodeHandler for Child<NodeAdderState, P> {
     
     type ToBuilderOuput = Child<InitState, P>;
 
-    fn add_node(&mut self, path: Path, node: usize, map_from_parent: Option<Box<dyn PropertyMapper>>) {
-        self.nodes.insert(path, (node, map_from_parent));
+    fn add_node(&mut self, path: Path, node: usize) {
+        self.nodes.insert(path, node);
     }
     
     fn to_builder(self) -> Self::ToBuilderOuput {
@@ -190,7 +176,8 @@ impl <P: NodeHandler> NodeHandler for Child<NodeAdderState, P> {
             _state: std::marker::PhantomData,
             tree: self.tree,
             nodes: self.nodes,
-            map_from_parent: self.map_from_parent,
+            map_view: self.map_view,
+            map_children: self.map_children,
             path: self.path,
             parent: self.parent,
             rules: self.rules
@@ -210,37 +197,40 @@ impl <P: NodeHandler> NodeBuilder for Child<InitState, P> {
         self
     }
 
-    fn path(self, path: Path, map_from_parent: Option<Box<dyn PropertyMapper>>) -> Self::PathOutput
+    fn path(self, path: Path, map_view: bool, map_children: Vec<Vec<Path>>) -> Self::PathOutput
         where Child<NodeAdderState, P>: NodeHandler
     {
         let build_parent = Child {
             _state: std::marker::PhantomData,
             tree: Rc::clone(&self.tree),
-            map_from_parent: self.map_from_parent,
+            map_view: self.map_view,
+            map_children: self.map_children,
             parent: self.parent,
             nodes: self.nodes,
             path: self.path,
             rules: self.rules
         };
-        Child::new(build_parent, Rc::clone(&self.tree), path, map_from_parent)
+        Child::new(build_parent, Rc::clone(&self.tree), path, map_view, map_children)
     }
 
     fn build(mut self) -> Self::BuildOutput {
         let mut parent = Node::new(
             self.path.clone(),
-            self.rules
+            self.rules,
+            self.map_view,
+            self.map_children
         );
         let mut tree = self.tree.borrow_mut();
         // for every child it declare, we must set it's parent with the help of the tree
         let parent_index = tree.next_index();
-        for (_1, (node, _2)) in &self.nodes {
+        for (_1, node) in &self.nodes {
             tree.set_child_parent(*node, parent_index);
         }
         parent.set_nodes(self.nodes);
         // we add the node to the vector
         tree.add_node(parent);
 
-        self.parent.add_node(self.path, parent_index, self.map_from_parent);
+        self.parent.add_node(self.path, parent_index);
 
         self.parent.to_builder()
     }
@@ -251,13 +241,15 @@ impl <P: NodeHandler> Child<InitState, P> {
         parent: P,
         tree: Rc<RefCell<Tree>>,
         path: Path,
-        map_from_parent: Option<Box<dyn PropertyMapper>>
+        map_view: bool,
+        map_children: Vec<Vec<Path>>
     ) -> Child<InitState, P> {
         Child {
             _state: std::marker::PhantomData,
             tree,
             path,
-            map_from_parent,
+            map_view,
+            map_children,
             parent,
             nodes: HashMap::new(),
             rules: Vec::new()
@@ -304,9 +296,9 @@ impl Tree {
         self.nodes.get(parent_index)
     }
 
-    pub fn children<'a, 'b>(&'a self, node: &'b Node) -> HashMap<Path, &'a Node> {
+    pub fn children<'b>(&self, node: &'b Node) -> HashMap<Path, &Node> {
         node.nodes.iter()
-        .filter_map(|(path,(index, _selector))| {
+        .filter_map(|(path,index)| {
             self.nodes.get(*index).and_then(|node| {Some((path.clone(), node))})
         }).collect()
     }
@@ -316,7 +308,9 @@ impl Tree {
 pub struct Node {
     path: Path,
     rules: Vec<Box<dyn Rule>>,
-    nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>,
+    map_view: bool,
+    map_children: Vec<Vec<Path>>,
+    nodes: HashMap<Path, usize>,
     parent: Option<usize>
 
 }
@@ -325,22 +319,34 @@ impl Node {
     pub fn new(
         path: Path,
         rules: Vec<Box<dyn Rule>>,
+        map_view: bool,
+        map_children: Vec<Vec<Path>>
     ) -> Self {
         Self {
             path,
             rules,
+            map_view,
+            map_children,
             nodes: HashMap::default(),
             parent: None
         }
     }
-    pub fn set_nodes(&mut self, nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>) {
+    pub fn set_nodes(&mut self, nodes: HashMap<Path, usize>) {
         self.nodes = nodes;
     }
-    pub fn nodes(&self) -> &HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)> {
+    pub fn nodes(&self) -> &HashMap<Path, usize> {
         &self.nodes
     }
     pub fn set_parent(&mut self, parent: usize) {
         self.parent = Some(parent);
+    }
+
+    pub fn map_view(&self) -> bool {
+        self.map_view
+    }
+
+    pub fn map_children(&self) -> &Vec<Vec<Path>> {
+        &self.map_children
     }
 
     pub fn path(&self) -> &Path {
@@ -360,6 +366,22 @@ pub struct NoFold;
 pub struct NoInit;
 pub struct NoAssert;
 
+type AsyncTestFn<R> = Arc<dyn Fn(Arc<Mutex<FullNodeView>>, Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = R> + Send + Sync>> + Send + Sync>;
+
+pub trait AsyncTest<R> {
+    fn call(& self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = R> + Send + Sync + 'static>>;
+}
+
+impl <'a, R, F, Fut> AsyncTest<R> for F
+where
+    F: Fn(Arc<Mutex<FullNodeView>>, Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Fut + Send + Sync,
+    Fut: Future<Output = R> + Send + Sync + 'static
+{
+    fn call(&self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = R> + Send + Sync + 'static>> {
+        Box::pin(self(view, ctx))
+    }
+}
+
 pub struct RuleBuilder<
     TestType,
     FoldType,
@@ -372,18 +394,18 @@ pub struct RuleBuilder<
     init: InitType,
     assert: AssertType,
 }
-impl RuleBuilder<
+impl <'a> RuleBuilder<
     NoTest,
     NoFold,
     NoInit,
     NoAssert,
 > {
-    pub fn test<R>(name: String, test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>) -> RuleBuilder<
-        Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+    pub fn test<R>(name: String, test: Arc<dyn AsyncTest<R> + Sync + Send>) -> RuleBuilder<
+        Arc<dyn AsyncTest<R> + Sync + Send>,
         NoFold,
         NoInit,
         NoAssert,
-    > {
+    > { 
         RuleBuilder {
             name,
             test: test,
@@ -395,7 +417,7 @@ impl RuleBuilder<
 }
 
 impl <R> RuleBuilder<
-    Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+    Arc<dyn AsyncTest<R> + Sync + Send>,
     NoFold,
     NoInit,
     NoAssert,
@@ -404,7 +426,7 @@ where
     R: Clone + 'static
 {
     pub fn fold<Acc: Send + 'static>(self, fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>) -> RuleBuilder<
-        Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+        Arc<dyn AsyncTest<R> + Sync + Send>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
         NoInit,
         NoAssert,
@@ -420,7 +442,7 @@ where
 }
 
 impl <R, Acc> RuleBuilder<
-    Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+    Arc<dyn AsyncTest<R> + Sync + Send>,
     Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
     NoInit,
     NoAssert,
@@ -430,7 +452,7 @@ where
     R: Clone + 'static
 {
     pub fn init(self, init: Box<dyn Fn() -> Acc>) -> RuleBuilder<
-        Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+        Arc<dyn AsyncTest<R> + Sync + Send>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
         Box<dyn Fn() -> Acc>,
         NoAssert,
@@ -446,7 +468,7 @@ where
 }
 
 impl <R, Acc> RuleBuilder<
-    Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+    Arc<dyn AsyncTest<R> + Sync + Send>,
     Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
     Box<dyn Fn() -> Acc>,
     NoAssert,
@@ -456,7 +478,7 @@ where
     R: Clone + 'static
 {
     pub fn assert(self, assert: Arc<dyn Fn(&Acc) -> bool + Send + Sync>) -> RuleBuilder<
-        Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+        Arc<dyn AsyncTest<R> + Sync + Send>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
         Box<dyn Fn() -> Acc>,
         Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
@@ -472,7 +494,7 @@ where
 }
 
 impl <R, Acc> RuleBuilder<
-    Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+    Arc<dyn AsyncTest<R> + Sync + Send>,
     Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
     Box<dyn Fn() -> Acc>,
     Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
@@ -501,7 +523,7 @@ pub struct ConcreteRule<Acc: Send + Debug + 'static, R: 'static> {
     name: String,
     state: Acc,
     #[educe(Debug(ignore))]
-    test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+    test: Arc<dyn AsyncTest<R> + Sync + Send>,
     #[educe(Debug(ignore))]
     fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
     #[educe(Debug(ignore))]
@@ -513,7 +535,7 @@ impl <Acc: Debug + Send + 'static, R: 'static> ConcreteRule<Acc, R> {
     pub fn new(
         name: String,
         init: Acc,
-        test: Arc<dyn Fn(&NodeView, &HashMap<String, String>) -> R + Send + Sync>,
+        test: Arc<dyn AsyncTest<R> + Sync + Send>,
         fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
         assert: Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
         assertion: &'static str, 
@@ -534,9 +556,10 @@ impl <Acc, R> Rule for ConcreteRule<Acc, R>
         Acc: Debug + Sync + Send + Clone + 'static,
         R: Clone + 'static
 {
-
-    fn fold(&mut self, view: &NodeView, ctx: &HashMap<String, String>) {
-        self.state = (self.fold)(&self.state, (self.test)(view, ctx))
+    fn fold(&mut self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + '_>> {
+        Box::pin(async move {
+            self.state = (self.fold)(&self.state, self.test.call(view, ctx).await);
+        })
     }
 
     fn assert(&self, path: &str) -> Diagnostic {
@@ -554,36 +577,99 @@ pub struct Diagnostic {
     pub statut: bool
 }
 
-#[derive(Debug)]
-pub struct NodeView {
-    index: usize,
-    text: Option<String>,
-    attrs: HashMap<String, String>
+pub trait CommonNodeView {
+    fn text(&self) -> Arc<Receiver<String>>;
+    fn attr(&self, key: &str) -> Option<&String>;
+    fn index(&self) -> usize;
 }
 
-impl NodeView {
+#[derive(Debug)]
+pub enum NodeView {
+    FullNodeView(FullNodeView),
+    PartialNodeView(PartialNodeView)
+}
 
-    pub fn new(attrs: HashMap<String, String>, index: usize) -> Self {
+#[derive(Debug)]
+pub struct FullNodeView {
+    index: usize,
+    text: Arc<Receiver<String>>,
+    attrs: HashMap<String, String>,
+    children: Arc<HashMap<Vec<Path>, Receiver<PartialNodeView>>>
+}
+
+impl FullNodeView {
+    pub fn new(
+        attrs: HashMap<String, String>,
+        index: usize,
+        receiver: Arc<Receiver<String>>,
+        children: Arc<HashMap<Vec<Path>, Receiver<PartialNodeView>>>
+    ) -> Self {
         Self {
             index,
             attrs,
-            text: None
-
+            text: receiver,
+            children
         }
     }
-    pub fn set_text(&mut self, text: &str) {
-        self.text = Some(String::from(text))
+
+    pub fn children(&self) -> Arc<HashMap<Vec<Path>, Receiver<PartialNodeView>>> {
+        self.children.clone()
     }
-    pub fn text(&self) -> Option<&String> {
-        self.text.as_ref()
+}
+
+impl CommonNodeView for FullNodeView {
+    fn text(&self) -> Arc<Receiver<String>> {
+        self.text.clone()
     }
 
-    pub fn attr(&self, key: &str) -> Option<&String> {
+    fn attr(&self, key: &str) -> Option<&String> {
         self.attrs.get(key)
     }
 
-    pub fn index(&self) -> usize {
+    fn index(&self) -> usize {
         self.index
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PartialNodeView {
+    index: usize,
+    text: Arc<Receiver<String>>,
+    attrs: HashMap<String, String>
+}
+
+impl PartialNodeView {
+
+    pub fn new(attrs: HashMap<String, String>, index: usize, receiver: Arc<Receiver<String>>) -> Self {
+        Self {
+            index,
+            attrs,
+            text: receiver
+        }
+    }
+}
+
+impl <'a> CommonNodeView for PartialNodeView {
+    fn text(&self) -> Arc<Receiver<String>> {
+        self.text.clone()
+    }
+
+    fn attr(&self, key: &str) -> Option<&String> {
+        self.attrs.get(key)
+    }
+
+    fn index(&self) -> usize {
+        self.index
+    }
+}
+
+impl Into<PartialNodeView> for FullNodeView {
+    fn into(self) -> PartialNodeView {
+        PartialNodeView {
+            index: self.index,
+            text: self.text,
+            attrs: self.attrs
+        }
     }
 }
 
