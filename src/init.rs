@@ -1,11 +1,32 @@
-use std::{fmt::Display, sync::{Arc, atomic::AtomicU64}};
+use std::{error::Error, fmt::Display, sync::{Arc, atomic::AtomicU64}};
 use educe::Educe;
 use futures::future::join_all;
 use itertools::Itertools;
-use tokio::{io::AsyncRead, runtime::Builder, sync::{Mutex, mpsc::{self, Receiver, Sender}}, task::JoinHandle};
+use tokio::{io::AsyncRead, spawn, sync::{Mutex, mpsc::{self, Receiver, Sender}}, task::JoinHandle};
 use std::io::Error as IoError;
 
-use crate::{collector::{FullDiagnostic, collect_results}, filereader::{TechnicalError, XmlWorkload, read}, rulebuilder::Tree, xmlworker::{FileResult, consume_xml_workload}};
+use crate::{cancellation::ShutdownHandle, collector::{FullDiagnostic, collect_results}, filereader::{XmlWorkload, read}, rulebuilder::Tree, xmlworker::{FileResult, consume_xml_workload}};
+
+#[derive(Debug, Clone)]
+pub struct FatalError {
+    pub message: String
+}
+
+impl FatalError {
+    pub fn new(message: &str) -> Self {
+        Self {
+            message: message.into()
+        }
+    }
+}
+
+impl Display for FatalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fatal error: {}", self.message)
+    }
+}
+
+impl Error for FatalError {}
 
 #[derive(Debug)]
 pub struct ValidatorError(String);
@@ -55,10 +76,8 @@ where
 
 pub async fn start<S>(
     file_receiver: Receiver<FileInfo<S>>,
-    error_sender: &Sender<TechnicalError>,
     diagnostic_sender: &Sender<FullDiagnostic>,
     reader_count: usize,
-    worker_count_multiplier: usize,
     worker_queue_size: usize,
     worker_task_multiplier: usize,
     view_queue_size: usize,
@@ -68,27 +87,10 @@ where
     S: AsyncRead + Unpin + Send + 'static
 {
 
-    // in order to prevent deadlocks, we need to track the work effectively done by the system.
-    // this take the shape of a node received work counter, incremented each time a view is taken into account.
-    let progress = Arc::new(AtomicU64::new(0));
+    let fatal_error_handle: ShutdownHandle<FatalError> = ShutdownHandle::new();
 
     let global_file_id_seq = Arc::new(AtomicU64::new(0));
-    let readers_runtime: tokio::runtime::Runtime = Builder::new_multi_thread()
-    .worker_threads(reader_count)
-    .enable_time()
-    .thread_name("reader-pool")
-    .build()?;
 
-    let workers_runtime = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(worker_count_multiplier * reader_count)
-    .enable_time()
-    .thread_name("rule-pool")
-    .build()?;
-
-    let collectors_runtime = tokio::runtime::Builder::new_multi_thread()
-    .worker_threads(reader_count)
-    .thread_name("collector-pool")
-    .build()?;
     // collector workers setup
     let (
         collector_senders,
@@ -101,19 +103,14 @@ where
     .unzip();
     let collector_handles: Vec<JoinHandle<()>> = collector_receivers.into_iter()
     .map(|mut rx| {
-        let cloned_error_sender = error_sender.clone();
         let cloned_diagnostic_sender = diagnostic_sender.clone();
-        collectors_runtime.spawn( async move {
-            match collect_results(
+        let cloned_fatal_error_handle = fatal_error_handle.clone();
+        spawn( async move {
+            collect_results(
                 &mut rx,
                 &cloned_diagnostic_sender,
-                &cloned_error_sender
-            ).await {
-                Ok(_) => {},
-                Err(err) => {
-                    println!("an error occured : {:?}", err)
-                }
-            }
+                cloned_fatal_error_handle
+            ).await;
         })
     }).collect();
     // rule workers setup
@@ -123,16 +120,21 @@ where
     ): (
         Vec<Sender<XmlWorkload>>,
         Vec<Receiver<XmlWorkload>>
-    ) = (1..=worker_count_multiplier * reader_count * worker_task_multiplier)
+    ) = (1..=reader_count * worker_task_multiplier)
     .map(|_| mpsc::channel::<XmlWorkload>(worker_queue_size))
     .unzip();
     let worker_handles: Vec<JoinHandle<()>> = worker_receivers.into_iter()
     // we want a uniform distribution, so we are cycling iterator, and capping it
-    .zip(collector_senders.clone().into_iter().cycle().take(worker_count_multiplier * reader_count * worker_task_multiplier))
+    .zip(collector_senders.clone().into_iter().cycle().take(reader_count * worker_task_multiplier))
     .map(|(mut rx, sender)| {
-        let cloned_progress = Arc::clone(&progress);
-        workers_runtime.spawn( async move {
-            match consume_xml_workload(&mut rx, Arc::new(sender), cloned_progress, view_queue_size).await {
+        let cloned_fatal_error_handle = fatal_error_handle.clone();
+        spawn( async move {
+            match consume_xml_workload(
+                &mut rx,
+                Arc::new(sender),
+                cloned_fatal_error_handle,
+                view_queue_size
+            ).await {
                 Ok(()) => {},
                 Err(err) => {
                     println!("an error occured : {:?}", err)
@@ -145,42 +147,50 @@ where
     let rx = Arc::new(Mutex::new(file_receiver));
     let reader_handles: Vec<JoinHandle<()>> = (1..=reader_count)
     .zip(collector_senders.into_iter())
-    .zip(worker_senders.into_iter().chunks(worker_count_multiplier * worker_count_multiplier).into_iter())
+    .zip(worker_senders.into_iter().chunks(worker_task_multiplier).into_iter())
     .map(|((_index, collector_sender), worker_senders)| {
         let rx = Arc::clone(&rx);
         let mut sender_loop = worker_senders.collect::<Vec<Sender<XmlWorkload>>>().into_iter().cycle();
-        let cloned_error_sender = error_sender.clone();
         let cloned_counter = Arc::clone(&global_file_id_seq);
-        readers_runtime.spawn(async move {
+        let cloned_fatal_error_handle = fatal_error_handle.clone();
+        spawn(async move {
             loop {
-                // let sent_descriptor = Arc::clone(&self)
-                let item = { rx.lock().await.recv().await };
-                match sender_loop.next() {
-                    Some(current_sender) => {
-                        match item {
-                            Some(FileInfo {
-                                filename,
-                                descriptors,
-                                stream_factory
-                            }) => {
-                                match read(
-                                cloned_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
-                                &filename,
-                                stream_factory(),
-                                descriptors,
-                                &current_sender,
-                                &collector_sender,
-                                &cloned_error_sender,
-                                view_queue_size
-                            ).await {
-                                   Ok(()) => {},
-                                    Err(err) => { println!("an error occured : {:?}", err) } 
+                tokio::select! {
+                    biased;
+                    _ = cloned_fatal_error_handle.is_cancelled() => {
+                        break;
+                    }
+                    mut item = rx.lock() => {
+                        let item = item.recv().await;
+                        match sender_loop.next() {
+                            Some(current_sender) => {
+                                match item {
+                                    Some(FileInfo {
+                                        filename,
+                                        descriptors,
+                                        stream_factory
+                                    }) => {
+                                        match read(
+                                        cloned_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+                                        &filename,
+                                        stream_factory(),
+                                        descriptors,
+                                        &current_sender,
+                                        &collector_sender,
+                                        view_queue_size,
+                                        cloned_fatal_error_handle.clone()
+                                    ).await {
+                                        Ok(()) => {},
+                                            Err(err) => { println!("an error occured : {:?}", err) } 
+                                        }
+                                    },
+                                    None => break,
                                 }
                             },
-                            None => break,
+                            None => {}
                         }
-                    },
-                    None => {}
+                    }
+            
                 }
             }
         })

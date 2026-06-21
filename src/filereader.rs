@@ -2,7 +2,7 @@ use std::{cell::BorrowError, collections::HashMap, error::Error, fmt::Display, o
 use tokio::{io::{AsyncRead, BufReader}, sync::{Mutex, mpsc::{Receiver, Sender, channel, error::SendError}}};
 use quick_xml::{Error as XmlError, Reader, events::{BytesStart, Event}};
 
-use crate::{rulebuilder::{Node, NodeView, Path, Rule, Tree}, xmlworker::FileResult};
+use crate::{cancellation::ShutdownHandle, init::FatalError, rulebuilder::{Node, NodeView, Path, Rule, Tree}, xmlworker::FileResult};
 
 #[derive(Debug)]
 pub struct TechnicalError {
@@ -64,7 +64,7 @@ impl <'a> ReaderContext<'a> {
         }
     }
 
-    pub fn match_child_swap_descriptor(&mut self, tree: &'a Tree, path: &Path) -> bool {
+    pub fn match_child_swap_descriptor(&mut self, tree: &'a Arc<Tree>, path: &Path) -> bool {
 
         let mut maybe_child: Option<&Node> = None;
         let matched = match tree.children(self.current_descriptor).get(path) {
@@ -89,6 +89,55 @@ impl <'a> ReaderContext<'a> {
                 self.current_descriptor = parent;
             },
             None => {}
+        }
+    }
+
+    pub fn missed_test_paths(&self, tree: &'a Tree) -> Option<Vec<Vec<Path>>> {
+        let root_node = tree.get_root();
+        let mut current_path: Vec<Path> = Vec::new();
+        let mut missed_paths: Vec<Vec<Path>> = Vec::new();
+        match root_node {
+            None => {None},
+            Some(node) => {
+                current_path.push(node.path().clone());
+                // if we miss the root node, then we can return early 
+                if !self.element_senders.contains_key(&current_path) {
+                    missed_paths.push(current_path.clone());
+                    return Some(missed_paths);
+                }
+                self.collect_missing_path_children(
+                    &mut missed_paths,
+                    &mut current_path,
+                    tree,
+                    &tree.children(node)
+                );
+                Some(missed_paths)
+            }
+        }
+    }
+
+    fn collect_missing_path_children(
+        &self,
+        collector: &mut Vec<Vec<Path>>,
+        current_path: &mut Vec<Path>,
+        tree: &Tree,
+        children: &HashMap<Path, &'a Node>
+    ) {
+        for (path, &node) in children {
+            current_path.push(path.clone());
+            // if the current children is missing, then dont bother
+            // checking children.
+            if !self.element_senders.contains_key(current_path) {
+                collector.push(current_path.clone());
+                continue;
+            }
+            self.collect_missing_path_children(
+                collector,
+                current_path,
+                tree,
+                &tree.children(node)
+            );
+            current_path.pop();
         }
     }
 }
@@ -128,8 +177,8 @@ pub async fn read<S>(
     descriptors: Arc<Tree>, 
     sender: &Sender<XmlWorkload>,
     collector_sender: &Sender<FileResult>,
-    error_sender: &Sender<TechnicalError>,
-    highwatermark: usize
+    highwatermark: usize,
+    fatal_error_handle: ShutdownHandle<FatalError>
 ) -> Result<(), FileReaderError>
 where
     S: AsyncRead + Unpin,
@@ -140,140 +189,218 @@ where
     let mut reader = Reader::from_reader(reader);
     let mut read_buf = Vec::new();
     reader.config_mut().trim_text(true);
-
     loop {
-        let mut reader_context =  reader_context.lock().await;
-        match reader.read_event_into_async(&mut read_buf).await? {
-            Event::Start(tag) => {
-                let tag_path = Path(String::from_utf8_lossy(tag.name().as_ref()).into());
-                match &reader_context.mode {
-                    ReaderState::Ignoring => {
-                        // if in ignoring state, we are skipping children
-                        // since switching out of ignore mode is made at the end tag, we can
-                        // safely add this tag to the ignore vector
-                        reader_context.ignore_path.push(tag_path);
-                    },
-                    ReaderState::Reading => {
-                        // if we hit the current descriptor path, we need to create a stream,
-                        // register it and send the payload to the pool
-                        // of workers
-                        if reader_context.current_descriptor.path().0.as_bytes() == tag.name().as_ref() {
-                            handle_path_match(
-                                file_id,
-                                file,
-                                Arc::clone(&workload_counter_seq),
-                                tag,
-                                &mut reader_context,
-                                sender,
-                                error_sender,
-                                highwatermark
-                            ).await?;
-                        } else {
-                            // if not, we must look into the descriptor children to check
-                            // for any match
-                            
-                            match reader_context.match_child_swap_descriptor(&descriptors, &tag_path) {
-                                true => {
-                                    // if found, we must trigger the same chain of events as for the matching tag one
-                                    handle_path_match(
-                                        file_id,
-                                        file,
-                                        Arc::clone(&workload_counter_seq),
-                                        tag,
-                                        &mut reader_context,
-                                        sender,
-                                        error_sender,
-                                        highwatermark
-                                    ).await?;
-                                },
-                                false => {
-                                    // if no child is a match, we must ignore this tag entirely,
-                                    // including his children, until we meet the closing tag
-                                    // first, we set up the mode, so that we skip early in the loop, and track depth
-                                    // second, we insert the first entry of the dive
-                                    reader_context.mode = ReaderState::Ignoring;
-                                    reader_context.ignore_path.push(tag_path);
-                                }
+        tokio::select! {
+            biased;
+            _ = fatal_error_handle.is_cancelled() => {
+                drop(reader);
+                break;
+            }
+            event = reader.read_event_into_async(&mut read_buf) => {
+                match event {
+                    Ok(mut event) => {
+                        let mut reader_context =  reader_context.lock().await;
+                        let should_abort = handle_reader_event(
+                            &mut reader_context,
+                            &mut event,
+                            file_id,
+                            file,
+                            &descriptors,
+                            sender,
+                            collector_sender,
+                            workload_counter_seq.clone(),
+                            fatal_error_handle.clone(),
+                            highwatermark
+                        ).await;
+                        if should_abort {
+                            break;
+                        }
+                        match &event {
+                            Event::Eof => {
+                                break;
                             }
+                            _ => {}
                         }
-                    }
-                };
-            },
-            Event::End(tag) => {
-                match reader_context.mode {
-                    ReaderState::Ignoring => {
-                        // if the current ignore vector length is one,
-                        // and the tag is the stored path,
-                        // we then switch to reading mode
-                        if
-                            reader_context.ignore_path.len() == 1
-                            && reader_context.ignore_path[0] == Path(String::from_utf8_lossy(tag.name().as_ref()).into())
-                        {
-                            reader_context.mode = ReaderState::Reading;
-                        }
-                        reader_context.ignore_path.pop();
                     },
-                    ReaderState::Reading => {
-                        // if we are reading, we need to send the upppermost view in construction
-                        match reader_context.current_view.pop() {
-                            Some(view) => {
-                                match reader_context.element_senders.get(&reader_context.current_path) {
-                                    Some((sender, _)) => {
-                                        sender.send(view).await?;
-                                    },
-                                    None => {}
-                                };
-                                // we must pop the current path also, to ensure proper tracking
-                                reader_context.current_path.pop();
-                                // finally, we must restore the parent descriptor as current descriptor
-                                reader_context.set_parent_swap_descriptor(&descriptors)
-                            },
-                            None => {}
-                        }
-
+                    Err(err) => {
+                        match collector_sender.send(FileResult::Aborted(file_id, format!("error reading xml : {:?}", err), file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
+                            Ok(()) => {},
+                            Err(err) => {
+                                fatal_error_handle.trigger_fatal(err.into()).await;
+                            }
+                        };
                     }
                 }
-            },
-            Event::Text(text) => {
-                // if we match any text, we must add it to the top of the pill view
-                let length = reader_context.current_view.len();
-                let view = &mut reader_context.current_view[length - 1];
-                view.set_text(String::from_utf8_lossy(&text.into_inner()).trim());
-            },
-            Event::Eof => {
-                // we need to send the termination of file to the collector so that it can emit the diagnostic
-                match collector_sender.send(FileResult::Terminated(file_id, file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
-                    Ok(_) => {},
-                    Err(err) => {
-                        match &err.0 {
-                            FileResult::Progress(_, file_name, _, _) |
-                            FileResult::Terminated(_, file_name, _) => {
-                                error_sender.send(TechnicalError {
-                                    error: err.to_string(),
-                                    file: file_name.to_string()
-                                }).await?
+            }
+        }
+        read_buf.clear();        
+    };
+    Ok(())
+}
+
+async fn handle_reader_event<'a, 'b>(
+    mut reader_context: &'b mut ReaderContext<'a>,
+    event: &mut Event<'_>,
+    file_id: u64,
+    file: &str,
+    descriptors: &'a Arc<Tree>, 
+    sender: &Sender<XmlWorkload>,
+    collector_sender: &Sender<FileResult>,
+    workload_counter_seq: Arc<AtomicU8>,
+    fatal_error_handle: ShutdownHandle<FatalError>,
+    highwatermark: usize,
+) -> bool {
+    match event {
+        Event::Start(tag) => {
+            let tag_path = Path(String::from_utf8_lossy(tag.name().as_ref()).into());
+            match &reader_context.mode {
+                ReaderState::Ignoring => {
+                    // if in ignoring state, we are skipping children
+                    // since switching out of ignore mode is made at the end tag, we can
+                    // safely add this tag to the ignore vector
+                    reader_context.ignore_path.push(tag_path);
+                },
+                ReaderState::Reading => {
+                    // if we hit the current descriptor path, we need to create a stream,
+                    // register it and send the payload to the pool
+                    // of workers
+                    if reader_context.current_descriptor.path().0.as_bytes() == tag.name().as_ref() {
+                        handle_path_match(
+                            file_id,
+                            file,
+                            Arc::clone(&workload_counter_seq),
+                            tag,
+                            &mut reader_context,
+                            sender,
+                            fatal_error_handle,
+                            highwatermark
+                        ).await;
+                    } else {
+                        // if not, we must look into the descriptor children to check
+                        // for any match
+                        
+                        match reader_context.match_child_swap_descriptor(&descriptors, &tag_path) {
+                            true => {
+                                // if found, we must trigger the same chain of events as for the matching tag one
+                                handle_path_match(
+                                    file_id,
+                                    file,
+                                    Arc::clone(&workload_counter_seq),
+                                    tag,
+                                    &mut reader_context,
+                                    sender,
+                                    fatal_error_handle,
+                                    highwatermark
+                                ).await;
+                            },
+                            false => {
+                                // if no child is a match, we must ignore this tag entirely,
+                                // including his children, until we meet the closing tag
+                                // first, we set up the mode, so that we skip early in the loop, and track depth
+                                // second, we insert the first entry of the dive
+                                reader_context.mode = ReaderState::Ignoring;
+                                reader_context.ignore_path.push(tag_path);
                             }
                         }
                     }
-                };
-                break;
-            },
-            _ => { continue; }
-        }
-    };
-    Ok(())
+                }
+            };
+        },
+        Event::End(tag) => {
+            match reader_context.mode {
+                ReaderState::Ignoring => {
+                    // if the current ignore vector length is one,
+                    // and the tag is the stored path,
+                    // we then switch to reading mode
+                    if
+                        reader_context.ignore_path.len() == 1
+                        && reader_context.ignore_path[0] == Path(String::from_utf8_lossy(tag.name().as_ref()).into())
+                    {
+                        reader_context.mode = ReaderState::Reading;
+                    }
+                    reader_context.ignore_path.pop();
+                },
+                ReaderState::Reading => {
+                    // if we are reading, we need to send the upppermost view in construction
+                    match reader_context.current_view.pop() {
+                        Some(view) => {
+                            match reader_context.element_senders.get(&reader_context.current_path) {
+                                Some((sender, _)) => {
+                                    match sender.send(view).await {
+                                        Ok(()) => {},
+                                        Err(err) => {
+                                            match collector_sender.send(FileResult::Aborted(
+                                                file_id,
+                                                format!("error sending node view : {:?}", err),
+                                                file.into(),
+                                                workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1
+                                            )).await {
+                                                Ok(()) => {
+                                                    return true;
+                                                },
+                                                Err(err) => {
+                                                    fatal_error_handle.trigger_fatal(err.into()).await;
+                                                }
+                                            };
+                                        }
+                                    }
+                                },
+                                None => {}
+                            };
+                            // we must pop the current path also, to ensure proper tracking
+                            reader_context.current_path.pop();
+                            // finally, we must restore the parent descriptor as current descriptor
+                            reader_context.set_parent_swap_descriptor(&descriptors)
+                        },
+                        None => {}
+                    }
+
+                }
+            }
+        },
+        Event::Text(text) => {
+            // if we match any text, we must add it to the top of the pill view
+            let length = reader_context.current_view.len();
+            let view = &mut reader_context.current_view[length - 1];
+            view.set_text(&String::from_utf8_lossy(&text.clone().into_inner()).trim());
+        },
+        Event::Eof => {
+            match reader_context.missed_test_paths(descriptors) {
+                Some(missed_paths) => {
+                    // if we are missing some paths, we need to terminate on error
+                    match collector_sender.send(FileResult::Missed(file_id, missed_paths, file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
+                        Ok(_) => {},
+                        Err(err) => {
+                            fatal_error_handle.trigger_fatal(err.into()).await;
+                        }
+                    };
+                },
+                None => {
+                    // we need to send the termination of file to the collector so that it can emit the diagnostic
+                    match collector_sender.send(FileResult::Terminated(file_id, file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
+                        Ok(_) => {},
+                        Err(err) => {
+                            fatal_error_handle.trigger_fatal(err.into()).await;
+                        }
+                    };
+                }
+            }
+        },
+        _ => {}
+    }
+    false
 }
 
 async fn handle_path_match<'a, 'b>(
     file_id: u64,
     file: &str,
     workload_id_seq: Arc<AtomicU8>,
-    tag: BytesStart<'_>,
+    tag: &mut BytesStart<'_>,
     reader_context: &'b mut ReaderContext<'a>,
     sender: &Sender<XmlWorkload>,
-    error_sender: &Sender<TechnicalError>,
+    fatal_error_handle: ShutdownHandle<FatalError>,
     highwatermark: usize
-) -> Result<(), FileReaderError> {
+) {
     // if there is no current channel, initiate one.
     // also push a new index to the stack
     // as long as the path
@@ -296,13 +423,8 @@ async fn handle_path_match<'a, 'b>(
         ).await {
             Ok(_e) => {},
             Err(err) => {
-                // if we fail to send the workload, we must
-                // prematurely stop the validation
-                // (technical error)
-                error_sender.send(TechnicalError {
-                    error: err.to_string(),
-                    file: err.0.file
-                }).await?
+                // TODO: halt with fatal
+                fatal_error_handle.trigger_fatal(err.into()).await;
             }
         };
         // we then store the sender on the hashmap, as long as the current element index
@@ -335,12 +457,11 @@ async fn handle_path_match<'a, 'b>(
         };
     }
     match reader_context.element_senders.get(&reader_context.current_path) {
-            Some((_, index)) => {
-                reader_context.current_view.push(NodeView::new(attrs, index.into()));
-            },
-            None => {
-                reader_context.current_view.push(NodeView::new(attrs, 0));
-            }
+        Some((_, index)) => {
+            reader_context.current_view.push(NodeView::new(attrs, index.into()));
+        },
+        None => {
+            reader_context.current_view.push(NodeView::new(attrs, 0));
         }
-    Ok(())
+    }
 }

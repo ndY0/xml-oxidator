@@ -3,3 +3,4 @@ pub mod filereader;
 pub mod xmlworker;
 pub mod collector;
 pub mod init;
+pub mod cancellation;

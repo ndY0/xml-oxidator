@@ -336,6 +336,9 @@ impl Node {
     pub fn set_nodes(&mut self, nodes: HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)>) {
         self.nodes = nodes;
     }
+    pub fn nodes(&self) -> &HashMap<Path, (usize, Option<Box<dyn PropertyMapper>>)> {
+        &self.nodes
+    }
     pub fn set_parent(&mut self, parent: usize) {
         self.parent = Some(parent);
     }
