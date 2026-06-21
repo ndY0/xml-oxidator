@@ -584,12 +584,6 @@ pub trait CommonNodeView {
 }
 
 #[derive(Debug)]
-pub enum NodeView {
-    FullNodeView(FullNodeView),
-    PartialNodeView(PartialNodeView)
-}
-
-#[derive(Debug)]
 pub struct FullNodeView {
     index: usize,
     text: Arc<Receiver<String>>,
@@ -660,16 +654,6 @@ impl <'a> CommonNodeView for PartialNodeView {
 
     fn index(&self) -> usize {
         self.index
-    }
-}
-
-impl Into<PartialNodeView> for FullNodeView {
-    fn into(self) -> PartialNodeView {
-        PartialNodeView {
-            index: self.index,
-            text: self.text,
-            attrs: self.attrs
-        }
     }
 }
 

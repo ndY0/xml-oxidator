@@ -2,7 +2,7 @@ use std::{cell::BorrowError, collections::HashMap, error::Error, fmt::Display, o
 use tokio::{io::{AsyncRead, BufReader}, sync::{Mutex, broadcast::{self, Receiver as BroadcastReceiver, Sender as BroadcastSender}, mpsc::{Receiver, Sender, channel, error::SendError}}};
 use quick_xml::{Error as XmlError, Reader, events::{BytesStart, Event}};
 
-use crate::{cancellation::ShutdownHandle, init::FatalError, rulebuilder::{FullNodeView, Node, NodeView, PartialNodeView, Path, Rule, Tree}, xmlworker::FileResult};
+use crate::{cancellation::ShutdownHandle, init::FatalError, rulebuilder::{CommonNodeView, FullNodeView, Node, PartialNodeView, Path, Rule, Tree}, xmlworker::FileResult};
 
 #[derive(Debug)]
 pub struct TechnicalError {
@@ -18,7 +18,8 @@ pub struct XmlWorkload {
     pub tag: String,
     pub path: Vec<Path>,
     pub rules: Vec<Box<dyn Rule>>,
-    pub events: Receiver<FullNodeView>
+    pub ctx: Arc<Mutex<HashMap<Vec<Path>, PartialNodeView>>>,
+    pub events: Receiver<Arc<Mutex<FullNodeView>>>
 }
 
 #[derive(Debug)]
@@ -44,13 +45,13 @@ impl From<&PathIndex> for usize {
 
 #[derive(Debug)]
 struct SenderContext {
-    pub sender: Sender<FullNodeView>,
+    pub sender: Sender<Arc<Mutex<FullNodeView>>>,
     pub path_index: PathIndex,
 }
 
 #[derive(Debug)]
 struct CurrentViewContext {
-    pub view: Arc<FullNodeView>,
+    pub view: Arc<Mutex<FullNodeView>>,
     pub text_sender: BroadcastSender<String>,
     pub children_sender: HashMap<Vec<Path>, BroadcastSender<PartialNodeView>>
 }
@@ -63,7 +64,7 @@ struct ReaderContext<'a> {
     pub element_senders: HashMap<Vec<Path>, SenderContext>,
     pub current_descriptor: &'a Node,
     pub current_view: Vec<CurrentViewContext>,
-    pub global_context: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>
+    pub global_context: Arc<Mutex<HashMap<Vec<Path>, PartialNodeView>>>
 }
 
 impl <'a> ReaderContext<'a> {
@@ -75,7 +76,7 @@ impl <'a> ReaderContext<'a> {
             ignore_path: Vec::new(),
             current_view: Vec::new(),
             element_senders: HashMap::new(),
-            global_context: Arc::new(HashMap::new())
+            global_context: Arc::new(Mutex::new(HashMap::new()))
         }
     }
 
@@ -287,6 +288,8 @@ async fn handle_reader_event<'a, 'b>(
                             tag,
                             &mut reader_context,
                             sender,
+                            collector_sender,
+                            workload_counter_seq,
                             fatal_error_handle,
                             highwatermark
                         ).await;
@@ -304,6 +307,8 @@ async fn handle_reader_event<'a, 'b>(
                                     tag,
                                     &mut reader_context,
                                     sender,
+                                    collector_sender,
+                                    workload_counter_seq,
                                     fatal_error_handle,
                                     highwatermark
                                 ).await;
@@ -337,47 +342,34 @@ async fn handle_reader_event<'a, 'b>(
                 },
                 ReaderState::Reading => {
                     // if we are reading, we need to send the upppermost view in construction
-                    match reader_context.current_view.pop() {
-                        Some(view) => {
-                            match reader_context.element_senders.get(&reader_context.current_path) {
-                                Some(SenderContext { sender, path_index }) => {
-                                    match sender.send(view.view).await {
-                                        Ok(()) => {},
-                                        Err(err) => {
-                                            match collector_sender.send(FileResult::Aborted(
-                                                file_id,
-                                                format!("error sending node view : {:?}", err),
-                                                file.into(),
-                                                workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1
-                                            )).await {
-                                                Ok(()) => {
-                                                    return true;
-                                                },
-                                                Err(err) => {
-                                                    fatal_error_handle.trigger_fatal(err.into()).await;
-                                                }
-                                            };
-                                        }
-                                    }
-                                },
-                                None => {}
-                            };
-                            // we must pop the current path also, to ensure proper tracking
-                            reader_context.current_path.pop();
-                            // finally, we must restore the parent descriptor as current descriptor
-                            reader_context.set_parent_swap_descriptor(&descriptors)
-                        },
-                        None => {}
+                    if let Some(_) = reader_context.current_view.pop() {
+                        // we must pop the current path also, to ensure proper tracking
+                        reader_context.current_path.pop();
+                        // finally, we must restore the parent descriptor as current descriptor
+                        reader_context.set_parent_swap_descriptor(&descriptors)
                     }
-
                 }
             }
         },
         Event::Text(text) => {
             // if we match any text, we must add it to the top of the pill view
             let length = reader_context.current_view.len();
-            let view = &mut reader_context.current_view[length - 1];
-            view.set_text(&String::from_utf8_lossy(&text.clone().into_inner()).trim());
+            let view_context = &mut reader_context.current_view[length - 1];
+             if let Err(err) = view_context.text_sender.send(String::from_utf8_lossy(&text.clone().into_inner()).trim().into()) {
+                match collector_sender.send(FileResult::Aborted(
+                    file_id,
+                    format!("error sending node view text : {:?}", err),
+                    file.into(),
+                    workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1
+                )).await {
+                    Ok(()) => {
+                        return true;
+                    },
+                    Err(err) => {
+                        fatal_error_handle.trigger_fatal(err.into()).await;
+                    }
+                };
+             }
         },
         Event::Eof => {
             match reader_context.missed_test_paths(descriptors) {
@@ -413,9 +405,11 @@ async fn handle_path_match<'a, 'b>(
     tag: &mut BytesStart<'_>,
     reader_context: &'b mut ReaderContext<'a>,
     sender: &Sender<XmlWorkload>,
+    collector_sender: &Sender<FileResult>,
+    workload_counter_seq: Arc<AtomicU8>,
     fatal_error_handle: ShutdownHandle<FatalError>,
     highwatermark: usize
-) {
+) -> bool {
     // if there is no current channel, initiate one.
     // also push a new index to the stack
     // as long as the path
@@ -423,9 +417,9 @@ async fn handle_path_match<'a, 'b>(
     reader_context.current_path.push(path);
     if !reader_context.element_senders.contains_key(&reader_context.current_path) {
         // creating the channel
-        let (tx, rx) = channel::<FullNodeView>(highwatermark);
+        let (tx, rx) = channel::<Arc<Mutex<FullNodeView>>>(highwatermark);
         //send the worload, including the event receiver
-        match sender.send(
+        if let Err(err) = sender.send(
             XmlWorkload {
                 file_id,
                 workload_counter: workload_id_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -433,14 +427,11 @@ async fn handle_path_match<'a, 'b>(
                 path: reader_context.current_path.clone(),
                 tag: String::from_utf8_lossy(tag.name().into_inner()).to_string(),
                 rules: reader_context.current_descriptor.rules(),
+                ctx: reader_context.global_context.clone(),
                 events: rx,
             }
         ).await {
-            Ok(_e) => {},
-            Err(err) => {
-                // TODO: halt with fatal
-                fatal_error_handle.trigger_fatal(err.into()).await;
-            }
+            fatal_error_handle.trigger_fatal(err.into()).await;
         };
         // we then store the sender on the hashmap, as long as the current element index
         let path = reader_context.current_path.clone();
@@ -449,7 +440,7 @@ async fn handle_path_match<'a, 'b>(
         // if there is already one, it's a new element of a stream, we need to
         // increment the current index
         match reader_context.element_senders.get_mut(&reader_context.current_path) {
-            Some(SenderContext { sender, path_index }) => {
+            Some(SenderContext { sender: _, path_index }) => {
                 *path_index += 1
             },
             None => {}
@@ -459,37 +450,50 @@ async fn handle_path_match<'a, 'b>(
     // we need to keep it until the end tag is met
     let mut attrs = HashMap::new();
     for attr in tag.attributes() {
-        match attr {
-            Ok(attr) => {
-                attrs.insert(
-                    String::from_utf8_lossy(attr.key.as_ref()).into(),
-                    String::from_utf8_lossy(attr.value.as_ref()).into()
-                );
-            },
-            // we ignore malformed attributes
-            Err(_e) => {}
+        if let Ok(attr) = attr {
+            attrs.insert(
+                String::from_utf8_lossy(attr.key.as_ref()).into(),
+                String::from_utf8_lossy(attr.value.as_ref()).into()
+            );
         };
     }
     match reader_context.element_senders.get(&reader_context.current_path) {
         Some(SenderContext { sender, path_index }) => {
             let (text_sender, text_receiver) = broadcast::channel(highwatermark);
             let text_receiver = Arc::new(text_receiver);
-            if reader_context.current_descriptor.map_view() {
-
-            }
             let (sender_stack, receiver_stack): (Vec<(Vec<Path>, BroadcastSender<PartialNodeView>)>, Vec<(Vec<Path>, BroadcastReceiver<PartialNodeView>)>) = reader_context.current_descriptor.map_children().iter()
             .map(|child| {
                 let (tx, rx) = broadcast::channel::<PartialNodeView>(highwatermark);
                 ((child.clone(), tx), (child.clone(), rx))
             }).unzip();
+            // create view
+            let inner_view = FullNodeView::new(
+                attrs.clone(),
+                path_index.into(),
+                text_receiver,
+                Arc::new(HashMap::from_iter(receiver_stack))
+            );
+            let inner_view_index = inner_view.index();
             let view = Arc::new(
-                FullNodeView::new(
-                    attrs,
-                    path_index.into(),
-                    text_receiver,
-                    Arc::new(HashMap::from_iter(receiver_stack))
+                Mutex::new(
+                    inner_view
                 )
             );
+            let partial_view = PartialNodeView::new(
+                attrs.clone(),
+                inner_view_index,
+                Arc::new(text_sender.subscribe())
+            );
+            // if we match the context mapper, we must register the view inside the global context
+            if reader_context.current_descriptor.map_view() {
+                let mut global_context = reader_context.global_context.lock().await;
+                
+                global_context.insert(
+                    reader_context.current_path.clone(),
+                    partial_view
+                );
+            }
+            // push it to stack
             reader_context.current_view.push(
                 CurrentViewContext {
                     view: view.clone(),
@@ -497,10 +501,31 @@ async fn handle_path_match<'a, 'b>(
                     children_sender: HashMap::from_iter(sender_stack)
                 }
             );
-            sender.send(view)
+            // TODO : check if any staked current_view need this view
+            // use the partial_view above
+
+
+            
+            // send it for processing
+            if let Err(err) = sender.send(view).await {
+                match collector_sender.send(FileResult::Aborted(
+                    file_id,
+                    format!("error sending node view : {:?}", err),
+                    file.into(),
+                    workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1
+                )).await {
+                    Ok(()) => {
+                        return true;
+                    },
+                    Err(err) => {
+                        fatal_error_handle.trigger_fatal(err.into()).await;
+                    }
+                };
+            }
         },
         None => {
             // reader_context.current_view.push(NodeView::new(attrs, 0));
         }
     }
+    false
 }
