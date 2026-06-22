@@ -3,6 +3,7 @@ use bumpalo::Bump;
 use crate::error::ReaderError;
 use crate::view::SubtreeNode;
 
+/// Intermediate node used during subtree capture before arena materialization.
 struct BuildNode {
     tag: String,
     attrs: Vec<(String, String)>,
@@ -10,6 +11,12 @@ struct BuildNode {
     children: Vec<BuildNode>,
 }
 
+/// Memory-limited buffer that accumulates XML events during subtree capture.
+///
+/// Events are pushed via [`start_element`](CaptureBuilder::start_element),
+/// [`end_element`](CaptureBuilder::end_element), and [`text`](CaptureBuilder::text).
+/// Call [`finalize`](CaptureBuilder::finalize) to materialize a bump-allocated
+/// [`SubtreeNode`] tree.
 pub(crate) struct CaptureBuilder {
     stack: Vec<BuildNode>,
     memory_usage: usize,
@@ -18,6 +25,7 @@ pub(crate) struct CaptureBuilder {
 }
 
 impl CaptureBuilder {
+    /// Creates a new capture builder with the given memory limit.
     #[inline]
     pub fn new(limit: usize, path_for_error: String) -> Self {
         Self {
@@ -28,6 +36,7 @@ impl CaptureBuilder {
         }
     }
 
+    /// Records an element open event, checking the memory limit.
     #[inline]
     pub fn start_element(
         &mut self,
@@ -48,6 +57,7 @@ impl CaptureBuilder {
         Ok(())
     }
 
+    /// Records an element close event, reparenting the node to its parent.
     #[inline]
     pub fn end_element(&mut self) {
         let node = self.stack.pop().expect("unbalanced capture events");
@@ -58,6 +68,7 @@ impl CaptureBuilder {
         }
     }
 
+    /// Appends text content to the current element, checking the memory limit.
     #[inline]
     pub fn text(&mut self, text: &str) -> Result<(), ReaderError> {
         if text.is_empty() {
@@ -75,6 +86,7 @@ impl CaptureBuilder {
         Ok(())
     }
 
+    /// Consumes the builder and materializes a bump-allocated [`SubtreeNode`] tree.
     #[inline]
     pub fn finalize<'a>(self, arena: &'a Bump) -> &'a SubtreeNode<'a> {
         let root = self.stack.into_iter().next().expect("empty capture");

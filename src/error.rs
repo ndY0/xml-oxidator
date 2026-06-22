@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+/// Errors that occur during [`DescriptorTree`](crate::tree::descriptor::DescriptorTree) construction.
 #[derive(Debug, Error)]
 pub enum BuilderError {
     #[error("no root node declared")]
@@ -18,6 +19,7 @@ pub enum BuilderError {
     NestedCapture { inner: String, outer: String },
 }
 
+/// Errors that occur during XML parsing and rule evaluation.
 #[derive(Debug, Error)]
 pub enum ReaderError {
     #[error("XML parse error: {source}")]
@@ -45,6 +47,7 @@ pub enum ReaderError {
     },
 }
 
+/// Top-level errors from the file-parallel validation pipeline.
 #[derive(Debug, Error)]
 pub enum PipelineError {
     #[error("reader error on file '{filename}': {source}")]

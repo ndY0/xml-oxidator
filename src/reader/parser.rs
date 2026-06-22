@@ -15,8 +15,11 @@ use crate::tree::descriptor::{DescriptorTree, NodeNeeds};
 use crate::tree::path::{NodeId, format_path};
 use crate::view::{ChildSummary, RuleResults, SubtreeView};
 
+/// Modal state of the parser: either streaming events or capturing a subtree.
 enum ReaderMode {
+    /// Normal streaming mode: events update the context stack directly.
     Streaming,
+    /// Capture mode: events are buffered into a [`CaptureBuilder`] until the subtree closes.
     Capturing {
         builder: CaptureBuilder,
         depth: usize,
@@ -28,6 +31,10 @@ enum ReaderMode {
 /// Default capacity for the diagnostics flush buffer.
 const DIAG_BUFFER_DEFAULT: usize = 256;
 
+/// Parses an XML stream, evaluating rules at element close time and sending diagnostics.
+///
+/// This is the core event loop implementing modal streaming/capture processing.
+/// Elements not declared in the descriptor tree are skipped entirely.
 pub fn parse_file<R: Rule, B: BufRead>(
     reader: B,
     tree: &DescriptorTree<R>,
@@ -115,7 +122,7 @@ pub fn parse_file<R: Rule, B: BufRead>(
     Ok(())
 }
 
-/// Zero-copy variant for in-memory XML data.
+/// Zero-copy variant of [`parse_file`] for in-memory XML data.
 pub fn parse_slice<R: Rule>(
     data: &[u8],
     tree: &DescriptorTree<R>,
@@ -492,6 +499,10 @@ fn handle_end<R: Rule>(
     Ok(())
 }
 
+/// Parser-internal streaming view that references a popped `NodeContext` by reference.
+///
+/// Unlike [`StreamingView`](crate::view::StreamingView) which indexes into the stack,
+/// this variant holds the current context separately since it has already been popped.
 struct StreamingViewOwned<'a, R> {
     ctx: &'a NodeContext,
     parent_stack: &'a [NodeContext],

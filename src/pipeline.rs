@@ -10,9 +10,16 @@ use crate::reader::parser::parse_file;
 use crate::rule::Rule;
 use crate::tree::descriptor::DescriptorTree;
 
+/// A lazily-loaded XML file to be validated.
+///
+/// The `stream_factory` closure is invoked once per file on the rayon worker thread,
+/// deferring I/O until the file is actually processed.
 pub struct FileInfo<R> {
+    /// Display name used in diagnostic and error output.
     pub filename: String,
+    /// Shared descriptor tree defining expected XML structure and rules.
     pub descriptors: Arc<DescriptorTree<R>>,
+    /// Factory that produces the byte stream for this file (called once, lazily).
     pub stream_factory: Box<dyn FnOnce() -> Box<dyn Read + Send> + Send>,
 }
 
@@ -24,9 +31,13 @@ impl<R> std::fmt::Debug for FileInfo<R> {
     }
 }
 
+/// Configuration for the file-parallel validation pipeline.
 pub struct PipelineConfig {
+    /// Number of rayon worker threads. `None` uses rayon's default (typically num CPUs).
     pub thread_count: Option<usize>,
+    /// Buffer capacity in bytes for the `BufReader` wrapping each file stream.
     pub buf_reader_capacity: usize,
+    /// Initial capacity for the per-file diagnostics flush buffer.
     pub diagnostics_buffer_size: usize,
 }
 
@@ -40,6 +51,10 @@ impl Default for PipelineConfig {
     }
 }
 
+/// Validates a batch of XML files in parallel, sending diagnostics through `diagnostics_tx`.
+///
+/// Returns a list of errors for files that failed to parse. Successfully parsed files
+/// produce zero or more diagnostics on the channel.
 pub fn run_pipeline<R: Rule + 'static>(
     files: Vec<FileInfo<R>>,
     diagnostics_tx: Sender<Diagnostic>,
@@ -54,6 +69,10 @@ pub fn run_pipeline<R: Rule + 'static>(
     })
 }
 
+/// Streaming variant of [`run_pipeline`] that pulls files from a crossbeam channel.
+///
+/// Files are consumed from `file_rx` and validated in parallel as they arrive.
+/// Useful when file discovery and validation should overlap.
 pub fn run_pipeline_streaming<R: Rule + 'static>(
     file_rx: Receiver<FileInfo<R>>,
     diagnostics_tx: Sender<Diagnostic>,

@@ -3,6 +3,7 @@ use crate::rule::Rule;
 use crate::tree::descriptor::{DescriptorNode, DescriptorTree, NodeNeeds};
 use crate::tree::path::{NodeId, PathSegment, format_path};
 
+/// Intermediate declaration of a node before the tree is finalized.
 struct NodeDeclaration<R> {
     tag: PathSegment,
     full_path: Vec<PathSegment>,
@@ -11,6 +12,11 @@ struct NodeDeclaration<R> {
     parent_index: Option<usize>,
 }
 
+/// Fluent builder for constructing a [`DescriptorTree`].
+///
+/// Uses a consuming-self API: each method takes `self` by value and returns it,
+/// enabling chained calls. Call [`build`](TreeBuilder::build) to finalize and
+/// validate the tree.
 pub struct TreeBuilder<R> {
     declarations: Vec<NodeDeclaration<R>>,
     parent_stack: Vec<usize>,
@@ -18,6 +24,7 @@ pub struct TreeBuilder<R> {
 }
 
 impl<R: Rule> TreeBuilder<R> {
+    /// Creates a new builder with the given root tag name (defaults to streaming mode).
     pub fn new(root_tag: &str) -> Self {
         let mut builder = TreeBuilder {
             declarations: Vec::new(),
@@ -35,24 +42,28 @@ impl<R: Rule> TreeBuilder<R> {
         builder
     }
 
+    /// Sets the current node to streaming access mode (O(depth) memory).
     pub fn streaming(mut self) -> Self {
         let idx = *self.parent_stack.last().unwrap();
         self.declarations[idx].is_capture = false;
         self
     }
 
+    /// Sets the current node to capture-subtree access mode (buffers a mini-DOM).
     pub fn capture_subtree(mut self) -> Self {
         let idx = *self.parent_stack.last().unwrap();
         self.declarations[idx].is_capture = true;
         self
     }
 
+    /// Attaches a validation rule to the current node.
     pub fn rule(mut self, rule: R) -> Self {
         let idx = *self.parent_stack.last().unwrap();
         self.declarations[idx].rules.push(rule);
         self
     }
 
+    /// Pushes a new child node with the given tag and descends into it.
     pub fn node(mut self, tag: &str) -> Self {
         let parent_idx = *self.parent_stack.last().unwrap();
         let mut full_path = self.declarations[parent_idx].full_path.clone();
@@ -69,6 +80,7 @@ impl<R: Rule> TreeBuilder<R> {
         self
     }
 
+    /// Ascends back to the parent node. Panics if called on the root.
     pub fn done(mut self) -> Self {
         assert!(
             self.parent_stack.len() > 1,
@@ -78,11 +90,15 @@ impl<R: Rule> TreeBuilder<R> {
         self
     }
 
+    /// Sets the maximum bytes a single subtree capture may consume.
     pub fn capture_limit(mut self, bytes: usize) -> Self {
         self.capture_memory_limit = bytes;
         self
     }
 
+    /// Validates and finalizes the tree, returning a [`DescriptorTree`] or a [`BuilderError`].
+    ///
+    /// Validates: no duplicate paths, no nested captures, rule/access-mode compatibility.
     pub fn build(self) -> Result<DescriptorTree<R>, BuilderError> {
         if self.declarations.is_empty() {
             return Err(BuilderError::NoRoot);

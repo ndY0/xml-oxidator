@@ -2,6 +2,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+/// A single segment of an XML element path, backed by `Arc<str>` for cheap cloning.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PathSegment(pub Arc<str>);
 
@@ -59,9 +60,11 @@ impl Ord for PathSegment {
     }
 }
 
+/// Opaque index into a [`DescriptorTree`](super::descriptor::DescriptorTree)'s node array.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId(pub(crate) u32);
 
+/// Formats a path segment slice as a `/`-separated string (e.g. `"root/child/grandchild"`).
 #[inline]
 pub fn format_path(segments: &[PathSegment]) -> String {
     segments
