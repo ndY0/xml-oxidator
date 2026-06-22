@@ -7,7 +7,7 @@ use xml_oxydizer::error::BuilderError;
 use xml_oxydizer::pipeline::{FileInfo, PipelineConfig};
 use xml_oxydizer::rule::{NodeAccess, Rule};
 use xml_oxydizer::tree::builder::TreeBuilder;
-use xml_oxydizer::tree::descriptor::AccessMode;
+use xml_oxydizer::tree::descriptor::NodeNeeds;
 
 #[cfg(feature = "test-heap")]
 use dhat::Alloc;
@@ -28,9 +28,6 @@ impl Rule for CheckAttr {
     fn name(&self) -> &str {
         self.name
     }
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::Streaming
-    }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         match node.attr(self.attr_name) {
             Some(v) if v == self.expected_value => vec![],
@@ -44,7 +41,7 @@ impl Rule for CheckAttr {
                     other
                 ),
                 element_path: node.path().to_vec(),
-                element_index: node.element_index(),
+                element_index: node.element_index() as u32,
             }],
         }
     }
@@ -60,9 +57,6 @@ impl Rule for CheckParentAttr {
     fn name(&self) -> &str {
         self.name
     }
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::Streaming
-    }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         match node.ancestor_attr(0, self.parent_attr) {
             Some(v) if v == self.expected_value => vec![],
@@ -74,7 +68,7 @@ impl Rule for CheckParentAttr {
                     self.parent_attr, self.expected_value, other
                 ),
                 element_path: node.path().to_vec(),
-                element_index: node.element_index(),
+                element_index: node.element_index() as u32,
             }],
         }
     }
@@ -89,9 +83,6 @@ impl Rule for CheckText {
     fn name(&self) -> &str {
         self.name
     }
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::Streaming
-    }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         if node.text() == self.expected {
             vec![]
@@ -101,7 +92,7 @@ impl Rule for CheckText {
                 severity: Severity::Error,
                 message: format!("expected text \"{}\", got \"{}\"", self.expected, node.text()),
                 element_path: node.path().to_vec(),
-                element_index: node.element_index(),
+                element_index: node.element_index() as u32,
             }]
         }
     }
@@ -117,15 +108,13 @@ impl Rule for CheckChildCount {
     fn name(&self) -> &str {
         self.name
     }
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::Streaming
+    fn needs(&self) -> NodeNeeds {
+        NodeNeeds::all()
     }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         let count = node
             .children_summaries()
-            .iter()
-            .filter(|c| c.tag.0.as_ref() == self.child_tag)
-            .count();
+            .len();
         if count == self.expected_count {
             vec![]
         } else {
@@ -137,7 +126,7 @@ impl Rule for CheckChildCount {
                     self.expected_count, self.child_tag, count
                 ),
                 element_path: node.path().to_vec(),
-                element_index: node.element_index(),
+                element_index: node.element_index() as u32,
             }]
         }
     }
@@ -152,8 +141,8 @@ impl Rule for CheckSubtreeHasChild {
     fn name(&self) -> &str {
         self.name
     }
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::CaptureSubtree
+    fn needs(&self) -> NodeNeeds {
+        NodeNeeds::all() | NodeNeeds::CAPTURE
     }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         match node.subtree() {
@@ -166,7 +155,7 @@ impl Rule for CheckSubtreeHasChild {
                         severity: Severity::Error,
                         message: format!("subtree missing child <{}>", self.child_tag),
                         element_path: node.path().to_vec(),
-                        element_index: node.element_index(),
+                        element_index: node.element_index() as u32,
                     }]
                 }
             }
@@ -175,7 +164,7 @@ impl Rule for CheckSubtreeHasChild {
                 severity: Severity::Error,
                 message: "no subtree available".to_owned(),
                 element_path: node.path().to_vec(),
-                element_index: node.element_index(),
+                element_index: node.element_index() as u32,
             }],
         }
     }
@@ -191,8 +180,8 @@ impl Rule for CountSubtreeDescendants {
     fn name(&self) -> &str {
         self.name
     }
-    fn access_mode(&self) -> AccessMode {
-        AccessMode::CaptureSubtree
+    fn needs(&self) -> NodeNeeds {
+        NodeNeeds::all() | NodeNeeds::CAPTURE
     }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         let count = node
@@ -210,7 +199,7 @@ impl Rule for CountSubtreeDescendants {
                     self.expected, self.tag, count
                 ),
                 element_path: node.path().to_vec(),
-                element_index: node.element_index(),
+                element_index: node.element_index() as u32,
             }]
         }
     }
@@ -229,19 +218,19 @@ fn test_streaming_10k_children() {
             name: "check_root_attr",
             attr_name: "test",
             expected_value: "value",
-        }))
+        }) as Box<dyn Rule>)
         .rule(Box::new(CheckChildCount {
             name: "check_child_count",
             child_tag: "child",
             expected_count: 10_000,
-        }))
+        }) as Box<dyn Rule>)
         .node("child")
             .streaming()
             .rule(Box::new(CheckAttr {
                 name: "check_child_attr",
                 attr_name: "test2",
                 expected_value: "value2",
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -282,14 +271,14 @@ fn test_streaming_with_failures() {
             name: "check_root",
             attr_name: "version",
             expected_value: "2",
-        }))
+        }) as Box<dyn Rule>)
         .node("item")
             .streaming()
             .rule(Box::new(CheckAttr {
                 name: "check_item",
                 attr_name: "status",
                 expected_value: "active",
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -327,7 +316,7 @@ fn test_parent_access() {
                 name: "check_parent",
                 parent_attr: "version",
                 expected_value: "3",
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -361,12 +350,12 @@ fn test_capture_subtree() {
             .rule(Box::new(CheckSubtreeHasChild {
                 name: "schema_has_field",
                 child_tag: "field",
-            }))
+            }) as Box<dyn Rule>)
             .rule(Box::new(CountSubtreeDescendants {
                 name: "schema_field_count",
                 tag: "field",
                 expected: 3,
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .node("entry")
             .streaming()
@@ -374,7 +363,7 @@ fn test_capture_subtree() {
                 name: "check_entry_sku",
                 attr_name: "sku",
                 expected_value: "ABC",
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -415,8 +404,8 @@ fn test_capture_with_parent_access() {
         fn name(&self) -> &str {
             "capture_parent_check"
         }
-        fn access_mode(&self) -> AccessMode {
-            AccessMode::CaptureSubtree
+        fn needs(&self) -> NodeNeeds {
+            NodeNeeds::all() | NodeNeeds::CAPTURE
         }
         fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
             match node.ancestor_attr(0, "version") {
@@ -426,7 +415,7 @@ fn test_capture_with_parent_access() {
                     severity: Severity::Error,
                     message: "parent missing version=3".to_owned(),
                     element_path: node.path().to_vec(),
-                    element_index: node.element_index(),
+                    element_index: node.element_index() as u32,
                 }],
             }
         }
@@ -436,7 +425,7 @@ fn test_capture_with_parent_access() {
         .streaming()
         .node("section")
             .capture_subtree()
-            .rule(Box::new(CaptureWithParent))
+            .rule(Box::new(CaptureWithParent) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -470,7 +459,7 @@ fn test_text_content() {
             .rule(Box::new(CheckText {
                 name: "check_msg",
                 expected: "hello world",
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -505,7 +494,7 @@ fn test_unmatched_elements_skipped() {
                 name: "check_target",
                 attr_name: "ok",
                 expected_value: "yes",
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -540,7 +529,7 @@ fn test_self_closing_tags() {
                 name: "check_item",
                 attr_name: "id",
                 expected_value: "1",
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -574,7 +563,7 @@ fn test_capture_overflow() {
             .rule(Box::new(CheckSubtreeHasChild {
                 name: "dummy",
                 child_tag: "x",
-            }))
+            }) as Box<dyn Rule>)
             .done()
         .capture_limit(100)
         .build()
@@ -615,14 +604,14 @@ fn test_multiple_files_parallel() {
                 name: "check_version",
                 attr_name: "v",
                 expected_value: "1",
-            }))
+            }) as Box<dyn Rule>)
             .build()
             .unwrap(),
     );
 
     let (diag_tx, diag_rx) = bounded(4096);
 
-    let files: Vec<FileInfo> = (0..100)
+    let files: Vec<FileInfo<Box<dyn Rule>>> = (0..100)
         .map(|i| {
             let tree = Arc::clone(&tree);
             let xml = format!(r#"<doc v="1">file {}</doc>"#, i);
@@ -652,7 +641,7 @@ fn test_streaming_pipeline_with_channel() {
                 name: "check_id",
                 attr_name: "id",
                 expected_value: "ok",
-            }))
+            }) as Box<dyn Rule>)
             .build()
             .unwrap(),
     );
@@ -693,7 +682,7 @@ fn test_lazy_loading() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let tree = Arc::new(
-        TreeBuilder::new("root")
+        TreeBuilder::<Box<dyn Rule>>::new("root")
             .streaming()
             .build()
             .unwrap(),
@@ -702,7 +691,7 @@ fn test_lazy_loading() {
     let counter = Arc::new(AtomicUsize::new(0));
     let (diag_tx, _diag_rx) = bounded(1024);
 
-    let files: Vec<FileInfo> = (0..5)
+    let files: Vec<FileInfo<Box<dyn Rule>>> = (0..5)
         .map(|i| {
             let tree = Arc::clone(&tree);
             let counter = Arc::clone(&counter);
@@ -731,7 +720,7 @@ fn test_builder_incompatible_access_mode() {
         .rule(Box::new(CheckSubtreeHasChild {
             name: "needs_capture",
             child_tag: "x",
-        }))
+        }) as Box<dyn Rule>)
         .build();
 
     assert!(matches!(result, Err(BuilderError::IncompatibleAccessMode { .. })));
@@ -739,7 +728,7 @@ fn test_builder_incompatible_access_mode() {
 
 #[test]
 fn test_builder_nested_capture_rejected() {
-    let result = TreeBuilder::new("root")
+    let result = TreeBuilder::<Box<dyn Rule>>::new("root")
         .capture_subtree()
         .node("inner")
             .capture_subtree()
@@ -759,9 +748,6 @@ fn test_sibling_visibility() {
         fn name(&self) -> &str {
             "sibling_count"
         }
-        fn access_mode(&self) -> AccessMode {
-            AccessMode::Streaming
-        }
         fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
             let siblings = node
                 .ancestor_children(0)
@@ -773,7 +759,7 @@ fn test_sibling_visibility() {
                     severity: Severity::Error,
                     message: format!("expected {} previous siblings, got {}", self.expected, siblings),
                     element_path: node.path().to_vec(),
-                    element_index: node.element_index(),
+                    element_index: node.element_index() as u32,
                 }]
             } else {
                 vec![]
@@ -785,7 +771,7 @@ fn test_sibling_visibility() {
         .streaming()
         .node("item")
             .streaming()
-            .rule(Box::new(CheckSiblingCount { expected: 2 }))
+            .rule(Box::new(CheckSiblingCount { expected: 2 }) as Box<dyn Rule>)
             .done()
         .build()
         .unwrap();
@@ -824,7 +810,7 @@ fn test_deep_nesting() {
                         name: "check_d",
                         attr_name: "val",
                         expected_value: "ok",
-                    }))
+                    }) as Box<dyn Rule>)
                     .done()
                 .done()
             .done()

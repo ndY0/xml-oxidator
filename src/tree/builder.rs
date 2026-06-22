@@ -1,25 +1,23 @@
-use std::collections::HashMap;
-
 use crate::error::BuilderError;
 use crate::rule::Rule;
-use crate::tree::descriptor::{AccessMode, DescriptorNode, DescriptorTree, NodeNeeds};
+use crate::tree::descriptor::{DescriptorNode, DescriptorTree, NodeNeeds};
 use crate::tree::path::{NodeId, PathSegment, format_path};
 
-struct NodeDeclaration {
+struct NodeDeclaration<R> {
     tag: PathSegment,
     full_path: Vec<PathSegment>,
-    access_mode: AccessMode,
-    rules: Vec<Box<dyn Rule>>,
+    is_capture: bool,
+    rules: Vec<R>,
     parent_index: Option<usize>,
 }
 
-pub struct TreeBuilder {
-    declarations: Vec<NodeDeclaration>,
+pub struct TreeBuilder<R> {
+    declarations: Vec<NodeDeclaration<R>>,
     parent_stack: Vec<usize>,
     capture_memory_limit: usize,
 }
 
-impl TreeBuilder {
+impl<R: Rule> TreeBuilder<R> {
     pub fn new(root_tag: &str) -> Self {
         let mut builder = TreeBuilder {
             declarations: Vec::new(),
@@ -29,7 +27,7 @@ impl TreeBuilder {
         builder.declarations.push(NodeDeclaration {
             tag: PathSegment::from(root_tag),
             full_path: vec![PathSegment::from(root_tag)],
-            access_mode: AccessMode::Streaming,
+            is_capture: false,
             rules: Vec::new(),
             parent_index: None,
         });
@@ -39,17 +37,17 @@ impl TreeBuilder {
 
     pub fn streaming(mut self) -> Self {
         let idx = *self.parent_stack.last().unwrap();
-        self.declarations[idx].access_mode = AccessMode::Streaming;
+        self.declarations[idx].is_capture = false;
         self
     }
 
     pub fn capture_subtree(mut self) -> Self {
         let idx = *self.parent_stack.last().unwrap();
-        self.declarations[idx].access_mode = AccessMode::CaptureSubtree;
+        self.declarations[idx].is_capture = true;
         self
     }
 
-    pub fn rule(mut self, rule: Box<dyn Rule>) -> Self {
+    pub fn rule(mut self, rule: R) -> Self {
         let idx = *self.parent_stack.last().unwrap();
         self.declarations[idx].rules.push(rule);
         self
@@ -63,7 +61,7 @@ impl TreeBuilder {
         self.declarations.push(NodeDeclaration {
             tag: PathSegment::from(tag),
             full_path,
-            access_mode: AccessMode::Streaming,
+            is_capture: false,
             rules: Vec::new(),
             parent_index: Some(parent_idx),
         });
@@ -85,35 +83,28 @@ impl TreeBuilder {
         self
     }
 
-    pub fn build(self) -> Result<DescriptorTree, BuilderError> {
+    pub fn build(self) -> Result<DescriptorTree<R>, BuilderError> {
         if self.declarations.is_empty() {
             return Err(BuilderError::NoRoot);
         }
 
-        let path_to_index: HashMap<Vec<PathSegment>, usize> = self
-            .declarations
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (d.full_path.clone(), i))
-            .collect();
-
-        if path_to_index.len() != self.declarations.len() {
+        // Check for duplicate paths
+        {
+            let mut seen = std::collections::HashMap::with_capacity(self.declarations.len());
             for (i, d) in self.declarations.iter().enumerate() {
-                for (j, d2) in self.declarations.iter().enumerate() {
-                    if i != j && d.full_path == d2.full_path {
-                        return Err(BuilderError::DuplicatePath {
-                            path: format_path(&d.full_path),
-                        });
-                    }
+                if let Some(prev) = seen.insert(&d.full_path, i) {
+                    let _ = prev;
+                    return Err(BuilderError::DuplicatePath {
+                        path: format_path(&d.full_path),
+                    });
                 }
             }
         }
 
+        // Validate rule capture compatibility
         for decl in &self.declarations {
             for rule in &decl.rules {
-                if rule.access_mode() == AccessMode::CaptureSubtree
-                    && decl.access_mode == AccessMode::Streaming
-                {
+                if rule.needs().is_capture() && !decl.is_capture {
                     return Err(BuilderError::IncompatibleAccessMode {
                         node_path: format_path(&decl.full_path),
                         rule_name: rule.name().to_owned(),
@@ -122,11 +113,12 @@ impl TreeBuilder {
             }
         }
 
+        // Check for nested capture
         for decl in &self.declarations {
-            if decl.access_mode == AccessMode::CaptureSubtree {
+            if decl.is_capture {
                 let mut ancestor_idx = decl.parent_index;
                 while let Some(idx) = ancestor_idx {
-                    if self.declarations[idx].access_mode == AccessMode::CaptureSubtree {
+                    if self.declarations[idx].is_capture {
                         return Err(BuilderError::NestedCapture {
                             inner: format_path(&decl.full_path),
                             outer: format_path(&self.declarations[idx].full_path),
@@ -137,34 +129,42 @@ impl TreeBuilder {
             }
         }
 
-        let mut nodes: Vec<DescriptorNode> = Vec::with_capacity(self.declarations.len());
+        let mut nodes: Vec<DescriptorNode<R>> = Vec::with_capacity(self.declarations.len());
         for decl in self.declarations {
-            let needs = decl.rules.iter().fold(NodeNeeds::empty(), |acc, r| acc | r.needs());
+            let mut needs = decl.rules.iter().fold(NodeNeeds::empty(), |acc, r| acc | r.needs());
+            // If the node is capture mode, ensure the CAPTURE bit is set in needs
+            if decl.is_capture {
+                needs |= NodeNeeds::CAPTURE;
+            }
             nodes.push(DescriptorNode {
-                tag: decl.tag,
                 full_path: decl.full_path,
-                access_mode: decl.access_mode,
                 rules: decl.rules,
-                parent_id: decl.parent_index.map(NodeId),
+                children_sorted: Vec::new(),
                 child_ids: Vec::new(),
-                child_tag_index: HashMap::new(),
+                tag: decl.tag,
+                parent_id: decl.parent_index.map(|i| NodeId(i as u32)),
                 needs,
                 summary_needs: NodeNeeds::empty(),
             });
         }
 
+        // Build child relationships
         for i in 0..nodes.len() {
             if let Some(parent_id) = nodes[i].parent_id {
-                let child_id = NodeId(i);
+                let child_id = NodeId(i as u32);
                 let child_tag = nodes[i].tag.clone();
-                nodes[parent_id.0].child_ids.push(child_id);
-                nodes[parent_id.0].child_tag_index.insert(child_tag, child_id);
+                nodes[parent_id.0 as usize].child_ids.push(child_id);
+                nodes[parent_id.0 as usize].children_sorted.push((child_tag, child_id));
             }
         }
 
-        // Propagate needs upward: if any child's rules use ancestor_attr/ancestor_text,
-        // the ancestors must store that data. Conservative: if a node has declared children
-        // in the tree, keep attrs and text so descendants can access them.
+        // Sort children_sorted by tag name for binary search
+        for node in &mut nodes {
+            node.children_sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
+        }
+
+        // Propagate needs upward: if any node has declared children in the tree,
+        // keep attrs and text so descendants can access them.
         for node in &mut nodes {
             if !node.child_ids.is_empty() {
                 node.needs = node.needs | NodeNeeds::ATTRS | NodeNeeds::TEXT;
@@ -174,7 +174,7 @@ impl TreeBuilder {
         // Compute summary_needs: what does the parent need from this child?
         for i in 0..nodes.len() {
             if let Some(parent_id) = nodes[i].parent_id {
-                let parent_needs = nodes[parent_id.0].needs;
+                let parent_needs = nodes[parent_id.0 as usize].needs;
                 if parent_needs.contains(NodeNeeds::CHILDREN) {
                     nodes[i].summary_needs = NodeNeeds::all();
                 }

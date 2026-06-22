@@ -2,11 +2,13 @@ use crate::tree::path::NodeId;
 use crate::view::ChildSummary;
 
 pub struct NodeContext {
-    pub descriptor_id: NodeId,
+    // Heap-allocated fields first
     pub attrs: Vec<(String, String)>,
     pub text: String,
     pub children: Vec<ChildSummary>,
-    pub index: usize,
+    // Then smaller fields
+    pub descriptor_id: NodeId,
+    pub index: u32,
 }
 
 pub(crate) struct ContextPool {
@@ -14,15 +16,17 @@ pub(crate) struct ContextPool {
 }
 
 impl ContextPool {
+    #[inline]
     pub fn new() -> Self {
         Self { free: Vec::new() }
     }
 
+    #[inline]
     pub fn acquire(
         &mut self,
         descriptor_id: NodeId,
         attrs: Vec<(String, String)>,
-        index: usize,
+        index: u32,
     ) -> NodeContext {
         if let Some(mut ctx) = self.free.pop() {
             ctx.descriptor_id = descriptor_id;
@@ -42,6 +46,7 @@ impl ContextPool {
         }
     }
 
+    #[inline]
     pub fn release(&mut self, mut ctx: NodeContext) {
         ctx.attrs.clear();
         ctx.text.clear();
@@ -55,12 +60,13 @@ pub(crate) struct AttrPool {
 }
 
 impl AttrPool {
+    #[inline]
     pub fn new() -> Self {
         Self { free: Vec::new() }
     }
 
+    #[inline]
     pub fn acquire(&mut self) -> Vec<(String, String)> {
         self.free.pop().unwrap_or_default()
     }
-
 }

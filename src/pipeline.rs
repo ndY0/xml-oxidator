@@ -7,15 +7,16 @@ use rayon::prelude::*;
 use crate::diagnostic::Diagnostic;
 use crate::error::PipelineError;
 use crate::reader::parser::parse_file;
+use crate::rule::Rule;
 use crate::tree::descriptor::DescriptorTree;
 
-pub struct FileInfo {
+pub struct FileInfo<R> {
     pub filename: String,
-    pub descriptors: Arc<DescriptorTree>,
+    pub descriptors: Arc<DescriptorTree<R>>,
     pub stream_factory: Box<dyn FnOnce() -> Box<dyn Read + Send> + Send>,
 }
 
-impl std::fmt::Debug for FileInfo {
+impl<R> std::fmt::Debug for FileInfo<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileInfo")
             .field("filename", &self.filename)
@@ -26,6 +27,7 @@ impl std::fmt::Debug for FileInfo {
 pub struct PipelineConfig {
     pub thread_count: Option<usize>,
     pub buf_reader_capacity: usize,
+    pub diagnostics_buffer_size: usize,
 }
 
 impl Default for PipelineConfig {
@@ -33,12 +35,13 @@ impl Default for PipelineConfig {
         Self {
             thread_count: None,
             buf_reader_capacity: 64 * 1024,
+            diagnostics_buffer_size: 256,
         }
     }
 }
 
-pub fn run_pipeline(
-    files: Vec<FileInfo>,
+pub fn run_pipeline<R: Rule + 'static>(
+    files: Vec<FileInfo<R>>,
     diagnostics_tx: Sender<Diagnostic>,
     config: &PipelineConfig,
 ) -> Vec<PipelineError> {
@@ -51,8 +54,8 @@ pub fn run_pipeline(
     })
 }
 
-pub fn run_pipeline_streaming(
-    file_rx: Receiver<FileInfo>,
+pub fn run_pipeline_streaming<R: Rule + 'static>(
+    file_rx: Receiver<FileInfo<R>>,
     diagnostics_tx: Sender<Diagnostic>,
     config: &PipelineConfig,
 ) -> Vec<PipelineError> {
@@ -74,8 +77,8 @@ fn build_pool(config: &PipelineConfig) -> rayon::ThreadPool {
     builder.build().expect("failed to build rayon thread pool")
 }
 
-fn process_file(
-    file_info: FileInfo,
+fn process_file<R: Rule>(
+    file_info: FileInfo<R>,
     diagnostics_tx: &Sender<Diagnostic>,
     buf_reader_capacity: usize,
 ) -> Option<PipelineError> {

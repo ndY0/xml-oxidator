@@ -1,92 +1,85 @@
-use std::collections::HashMap;
-
-use crate::rule::Rule;
 use crate::tree::path::{NodeId, PathSegment};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccessMode {
-    Streaming,
-    CaptureSubtree,
+pub struct NodeNeeds(u8);
+
+impl NodeNeeds {
+    pub const ATTRS: Self = Self(0x01);
+    pub const TEXT: Self = Self(0x02);
+    pub const CHILDREN: Self = Self(0x04);
+    pub const CAPTURE: Self = Self(0x08);
+
+    #[inline(always)]
+    pub const fn empty() -> Self { Self(0) }
+
+    /// ATTRS | TEXT | CHILDREN (not CAPTURE)
+    #[inline(always)]
+    pub const fn all() -> Self { Self(0x07) }
+
+    #[inline(always)]
+    pub const fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
+
+    #[inline(always)]
+    pub const fn is_capture(self) -> bool { self.0 & 0x08 != 0 }
+
+    #[inline(always)]
+    pub const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
 }
 
-bitflags! {
-    /// What data a node's rules actually access, computed at build time.
-    /// When a flag is absent, the parser skips collecting that data entirely.
-    pub struct NodeNeeds: u8 {
-        const ATTRS    = 0b0001;
-        const TEXT     = 0b0010;
-        const CHILDREN = 0b0100;
-    }
+impl std::ops::BitOr for NodeNeeds {
+    type Output = Self;
+    #[inline(always)]
+    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
 }
 
-pub struct DescriptorNode {
-    pub tag: PathSegment,
+impl std::ops::BitOrAssign for NodeNeeds {
+    #[inline(always)]
+    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+}
+
+pub struct DescriptorNode<R> {
+    // Pointers / Vecs first (8-byte aligned)
     pub full_path: Vec<PathSegment>,
-    pub access_mode: AccessMode,
-    pub rules: Vec<Box<dyn Rule>>,
-    pub parent_id: Option<NodeId>,
+    pub rules: Vec<R>,
+    pub children_sorted: Vec<(PathSegment, NodeId)>,
     pub child_ids: Vec<NodeId>,
-    pub child_tag_index: HashMap<PathSegment, NodeId>,
+    pub tag: PathSegment,
+    // Then Option<NodeId> (u32 + discriminant)
+    pub parent_id: Option<NodeId>,
+    // Then u8s
     pub needs: NodeNeeds,
-    /// What ancestors need from this node when it appears as a ChildSummary.
-    /// Computed by OR-ing parent_needs of ancestor nodes.
     pub summary_needs: NodeNeeds,
 }
 
-pub struct DescriptorTree {
-    pub(crate) nodes: Vec<DescriptorNode>,
+pub struct DescriptorTree<R> {
+    pub(crate) nodes: Vec<DescriptorNode<R>>,
     pub(crate) root_id: Option<NodeId>,
     pub capture_memory_limit: usize,
 }
 
-impl DescriptorTree {
-    pub fn root(&self) -> Option<&DescriptorNode> {
-        self.root_id.map(|id| &self.nodes[id.0])
+impl<R> DescriptorTree<R> {
+    #[inline(always)]
+    pub fn root(&self) -> Option<&DescriptorNode<R>> {
+        self.root_id.map(|id| &self.nodes[id.0 as usize])
     }
 
+    #[inline(always)]
     pub fn root_id(&self) -> Option<NodeId> {
         self.root_id
     }
 
-    pub fn get(&self, id: NodeId) -> &DescriptorNode {
-        &self.nodes[id.0]
+    #[inline(always)]
+    pub fn get(&self, id: NodeId) -> &DescriptorNode<R> {
+        &self.nodes[id.0 as usize]
     }
 
+    #[inline(always)]
     pub fn child_of(&self, parent_id: NodeId, tag: &str) -> Option<NodeId> {
-        let parent = &self.nodes[parent_id.0];
-        parent.child_tag_index.get(tag).copied()
+        let parent = self.get(parent_id);
+        parent
+            .children_sorted
+            .binary_search_by(|(k, _)| k.0.as_ref().cmp(tag))
+            .ok()
+            .map(|i| parent.children_sorted[i].1)
     }
 }
-
-macro_rules! bitflags {
-    (
-        $(#[$outer:meta])*
-        pub struct $Name:ident: $T:ty {
-            $($(#[$inner:meta])* const $Flag:ident = $value:expr;)*
-        }
-    ) => {
-        $(#[$outer])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub struct $Name($T);
-
-        impl $Name {
-            $($(#[$inner])* pub const $Flag: Self = Self($value);)*
-
-            pub const fn empty() -> Self { Self(0) }
-            pub const fn all() -> Self { Self($($value)|*) }
-            pub const fn contains(self, other: Self) -> bool { (self.0 & other.0) == other.0 }
-            pub const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
-        }
-
-        impl std::ops::BitOr for $Name {
-            type Output = Self;
-            fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
-        }
-
-        impl std::ops::BitOrAssign for $Name {
-            fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
-        }
-    };
-}
-
-pub(crate) use bitflags;

@@ -26,7 +26,10 @@ harness = false
 [profile.release]
 lto = "fat"
 codegen-units = 1
+strip = "symbols"
+panic = "abort"
 
 [profile.bench]
 lto = "fat"
 codegen-units = 1
+strip = "symbols"

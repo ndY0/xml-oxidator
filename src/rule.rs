@@ -1,5 +1,5 @@
 use crate::diagnostic::Diagnostic;
-use crate::tree::descriptor::{AccessMode, NodeNeeds};
+use crate::tree::descriptor::NodeNeeds;
 use crate::tree::path::PathSegment;
 use crate::view::{ChildSummary, SubtreeNode};
 
@@ -20,12 +20,29 @@ pub trait NodeAccess {
 
 pub trait Rule: Send + Sync {
     fn name(&self) -> &str;
-    fn access_mode(&self) -> AccessMode;
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic>;
 
     /// Declares what data this rule reads from the element.
-    /// Defaults to all data. Override to enable skip optimizations.
+    /// Defaults to all data (ATTRS | TEXT | CHILDREN).
+    /// Set the CAPTURE flag if this rule requires subtree capture.
     fn needs(&self) -> NodeNeeds {
         NodeNeeds::all()
+    }
+}
+
+// Blanket impl so that `Box<dyn Rule>` is itself a `Rule`.
+// This allows `TreeBuilder<Box<dyn Rule>>` to work with heterogeneous rule sets.
+impl Rule for Box<dyn Rule> {
+    #[inline]
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+    #[inline]
+    fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
+        (**self).evaluate(node)
+    }
+    #[inline]
+    fn needs(&self) -> NodeNeeds {
+        (**self).needs()
     }
 }

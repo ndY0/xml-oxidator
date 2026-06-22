@@ -20,7 +20,7 @@
 ///   - **Rules** — struct-literal expressions (identified by starting with a path/ident).
 ///   - **Child nodes** — identified by starting with a string literal, recursively.
 ///
-/// Returns `Result<DescriptorTree, BuilderError>`.
+/// Returns `Result<DescriptorTree<Box<dyn Rule>>, BuilderError>`.
 ///
 /// # Example
 ///
@@ -46,7 +46,7 @@
 macro_rules! build_tree {
     // Entry point: root node with explicit mode
     ($tag:literal $mode:ident { $($body:tt)* }) => {{
-        let builder = $crate::tree::builder::TreeBuilder::new($tag);
+        let builder = $crate::tree::builder::TreeBuilder::<::std::boxed::Box<dyn $crate::rule::Rule>>::new($tag);
         let builder = $crate::build_tree!(@mode builder, $mode);
         let builder = $crate::build_tree!(@items builder, $($body)*);
         builder.build()
@@ -54,7 +54,7 @@ macro_rules! build_tree {
 
     // Entry point: root node without mode (defaults to streaming)
     ($tag:literal { $($body:tt)* }) => {{
-        let builder = $crate::tree::builder::TreeBuilder::new($tag);
+        let builder = $crate::tree::builder::TreeBuilder::<::std::boxed::Box<dyn $crate::rule::Rule>>::new($tag);
         let builder = $crate::build_tree!(@items builder, $($body)*);
         builder.build()
     }};
@@ -103,12 +103,12 @@ macro_rules! build_tree {
 
     // Rule (struct literal via ident path), then comma + rest
     (@items $builder:expr, $($rule_path:ident)::+ { $($fields:tt)* } , $($rest:tt)*) => {{
-        let builder = $builder.rule(::std::boxed::Box::new($($rule_path)::+ { $($fields)* }));
+        let builder = $builder.rule(::std::boxed::Box::new($($rule_path)::+ { $($fields)* }) as ::std::boxed::Box<dyn $crate::rule::Rule>);
         $crate::build_tree!(@items builder, $($rest)*)
     }};
 
     // Rule (struct literal via ident path), last item
     (@items $builder:expr, $($rule_path:ident)::+ { $($fields:tt)* }) => {{
-        $builder.rule(::std::boxed::Box::new($($rule_path)::+ { $($fields)* }))
+        $builder.rule(::std::boxed::Box::new($($rule_path)::+ { $($fields)* }) as ::std::boxed::Box<dyn $crate::rule::Rule>)
     }};
 }

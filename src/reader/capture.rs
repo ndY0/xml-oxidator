@@ -18,6 +18,7 @@ pub(crate) struct CaptureBuilder {
 }
 
 impl CaptureBuilder {
+    #[inline]
     pub fn new(limit: usize, path_for_error: String) -> Self {
         Self {
             stack: Vec::new(),
@@ -27,6 +28,7 @@ impl CaptureBuilder {
         }
     }
 
+    #[inline]
     pub fn start_element(
         &mut self,
         tag: &str,
@@ -46,6 +48,7 @@ impl CaptureBuilder {
         Ok(())
     }
 
+    #[inline]
     pub fn end_element(&mut self) {
         let node = self.stack.pop().expect("unbalanced capture events");
         if let Some(parent) = self.stack.last_mut() {
@@ -55,6 +58,7 @@ impl CaptureBuilder {
         }
     }
 
+    #[inline]
     pub fn text(&mut self, text: &str) -> Result<(), ReaderError> {
         if text.is_empty() {
             return Ok(());
@@ -71,6 +75,7 @@ impl CaptureBuilder {
         Ok(())
     }
 
+    #[inline]
     pub fn finalize<'a>(self, arena: &'a Bump) -> &'a SubtreeNode<'a> {
         let root = self.stack.into_iter().next().expect("empty capture");
         Self::build_arena_node(root, arena)
@@ -113,6 +118,7 @@ impl CaptureBuilder {
         })
     }
 
+    #[inline]
     fn check_limit(&self) -> Result<(), ReaderError> {
         if self.memory_usage > self.memory_limit {
             Err(ReaderError::CaptureOverflow {

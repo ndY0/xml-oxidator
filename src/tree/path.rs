@@ -6,12 +6,14 @@ use std::sync::Arc;
 pub struct PathSegment(pub Arc<str>);
 
 impl Hash for PathSegment {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.as_ref().hash(state);
     }
 }
 
 impl std::borrow::Borrow<str> for PathSegment {
+    #[inline]
     fn borrow(&self) -> &str {
         &self.0
     }
@@ -30,20 +32,37 @@ impl fmt::Display for PathSegment {
 }
 
 impl From<&str> for PathSegment {
+    #[inline]
     fn from(s: &str) -> Self {
         Self(Arc::from(s))
     }
 }
 
 impl From<String> for PathSegment {
+    #[inline]
     fn from(s: String) -> Self {
         Self(Arc::from(s.as_str()))
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct NodeId(pub(crate) usize);
+impl PartialOrd for PathSegment {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
+impl Ord for PathSegment {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.as_ref().cmp(other.0.as_ref())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct NodeId(pub(crate) u32);
+
+#[inline]
 pub fn format_path(segments: &[PathSegment]) -> String {
     segments
         .iter()

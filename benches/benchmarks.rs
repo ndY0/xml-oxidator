@@ -8,7 +8,7 @@ use xml_oxydizer::diagnostic::{Diagnostic, Severity};
 use xml_oxydizer::pipeline::{FileInfo, PipelineConfig, run_pipeline, run_pipeline_streaming};
 use xml_oxydizer::rule::{NodeAccess, Rule};
 use xml_oxydizer::tree::builder::TreeBuilder;
-use xml_oxydizer::tree::descriptor::AccessMode;
+use xml_oxydizer::tree::descriptor::NodeNeeds;
 
 // ---------------------------------------------------------------------------
 // Reusable rules
@@ -17,14 +17,12 @@ use xml_oxydizer::tree::descriptor::AccessMode;
 struct NoopRule;
 impl Rule for NoopRule {
     fn name(&self) -> &str { "noop" }
-    fn access_mode(&self) -> AccessMode { AccessMode::Streaming }
     fn evaluate(&self, _node: &dyn NodeAccess) -> Vec<Diagnostic> { vec![] }
 }
 
 struct CheckAttrRule { attr: &'static str, expected: &'static str }
 impl Rule for CheckAttrRule {
     fn name(&self) -> &str { "check_attr" }
-    fn access_mode(&self) -> AccessMode { AccessMode::Streaming }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         match node.attr(self.attr) {
             Some(v) if v == self.expected => vec![],
@@ -33,7 +31,7 @@ impl Rule for CheckAttrRule {
                 severity: Severity::Error,
                 message: "mismatch".into(),
                 element_path: node.path().to_vec(),
-                element_index: node.element_index(),
+                element_index: node.element_index() as u32,
             }],
         }
     }
@@ -42,7 +40,6 @@ impl Rule for CheckAttrRule {
 struct HeavyAttrRule;
 impl Rule for HeavyAttrRule {
     fn name(&self) -> &str { "heavy_attr" }
-    fn access_mode(&self) -> AccessMode { AccessMode::Streaming }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         let mut hash: u64 = 0;
         node.for_each_attr(&mut |k, v| {
@@ -67,7 +64,6 @@ impl Rule for HeavyAttrRule {
 struct ChildAggregateRule;
 impl Rule for ChildAggregateRule {
     fn name(&self) -> &str { "child_aggregate" }
-    fn access_mode(&self) -> AccessMode { AccessMode::Streaming }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         let mut seen = std::collections::HashSet::new();
         for child in node.children_summaries() {
@@ -83,7 +79,7 @@ impl Rule for ChildAggregateRule {
 struct SubtreeCountRule { tag: &'static str }
 impl Rule for SubtreeCountRule {
     fn name(&self) -> &str { "subtree_count" }
-    fn access_mode(&self) -> AccessMode { AccessMode::CaptureSubtree }
+    fn needs(&self) -> NodeNeeds { NodeNeeds::all() | NodeNeeds::CAPTURE }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         let count = node.subtree().map(|s| s.find_all(self.tag).len()).unwrap_or(0);
         std::hint::black_box(count);
@@ -94,7 +90,7 @@ impl Rule for SubtreeCountRule {
 struct SubtreeDeepTraversal;
 impl Rule for SubtreeDeepTraversal {
     fn name(&self) -> &str { "subtree_deep" }
-    fn access_mode(&self) -> AccessMode { AccessMode::CaptureSubtree }
+    fn needs(&self) -> NodeNeeds { NodeNeeds::all() | NodeNeeds::CAPTURE }
     fn evaluate(&self, node: &dyn NodeAccess) -> Vec<Diagnostic> {
         if let Some(st) = node.subtree() {
             let mut total_attrs = 0usize;
@@ -217,7 +213,7 @@ fn drain_channel(rx: &crossbeam_channel::Receiver<Diagnostic>) -> usize {
     count
 }
 
-fn make_file(name: &str, tree: &Arc<xml_oxydizer::tree::descriptor::DescriptorTree>, xml: Vec<u8>) -> FileInfo {
+fn make_file(name: &str, tree: &Arc<xml_oxydizer::tree::descriptor::DescriptorTree<Box<dyn Rule>>>, xml: Vec<u8>) -> FileInfo<Box<dyn Rule>> {
     let tree = Arc::clone(tree);
     FileInfo {
         filename: name.to_owned(),
@@ -241,10 +237,10 @@ fn bench_flat_streaming(c: &mut Criterion) {
         let tree = Arc::new(
             TreeBuilder::new("root")
                 .streaming()
-                .rule(Box::new(CheckAttrRule { attr: "version", expected: "1" }))
+                .rule(Box::new(CheckAttrRule { attr: "version", expected: "1" }) as Box<dyn Rule>)
                 .node("item")
                     .streaming()
-                    .rule(Box::new(CheckAttrRule { attr: "status", expected: "active" }))
+                    .rule(Box::new(CheckAttrRule { attr: "status", expected: "active" }) as Box<dyn Rule>)
                     .done()
                 .build()
                 .unwrap(),
@@ -284,7 +280,7 @@ fn bench_parse_only_no_rules(c: &mut Criterion) {
                 .streaming()
                 .node("item")
                     .streaming()
-                    .rule(Box::new(NoopRule))
+                    .rule(Box::new(NoopRule) as Box<dyn Rule>)
                     .done()
                 .build()
                 .unwrap(),
@@ -324,9 +320,9 @@ fn bench_heavy_rules(c: &mut Criterion) {
                 .streaming()
                 .node("item")
                     .streaming()
-                    .rule(Box::new(HeavyAttrRule))
-                    .rule(Box::new(HeavyAttrRule))
-                    .rule(Box::new(HeavyAttrRule))
+                    .rule(Box::new(HeavyAttrRule) as Box<dyn Rule>)
+                    .rule(Box::new(HeavyAttrRule) as Box<dyn Rule>)
+                    .rule(Box::new(HeavyAttrRule) as Box<dyn Rule>)
                     .done()
                 .build()
                 .unwrap(),
@@ -364,7 +360,7 @@ fn bench_deep_nesting(c: &mut Criterion) {
         let tree = Arc::new(
             TreeBuilder::new("root")
                 .streaming()
-                .rule(Box::new(NoopRule))
+                .rule(Box::new(NoopRule) as Box<dyn Rule>)
                 .build()
                 .unwrap(),
         );
@@ -403,12 +399,12 @@ fn bench_capture_subtree(c: &mut Criterion) {
                 .streaming()
                 .node("schema")
                     .capture_subtree()
-                    .rule(Box::new(SubtreeCountRule { tag: "field" }))
-                    .rule(Box::new(SubtreeDeepTraversal))
+                    .rule(Box::new(SubtreeCountRule { tag: "field" }) as Box<dyn Rule>)
+                    .rule(Box::new(SubtreeDeepTraversal) as Box<dyn Rule>)
                     .done()
                 .node("entry")
                     .streaming()
-                    .rule(Box::new(CheckAttrRule { attr: "sku", expected: "SKU0" }))
+                    .rule(Box::new(CheckAttrRule { attr: "sku", expected: "SKU0" }) as Box<dyn Rule>)
                     .done()
                 .build()
                 .unwrap(),
@@ -448,7 +444,7 @@ fn bench_noise_skip(c: &mut Criterion) {
                 .streaming()
                 .node("target")
                     .streaming()
-                    .rule(Box::new(CheckAttrRule { attr: "id", expected: "0" }))
+                    .rule(Box::new(CheckAttrRule { attr: "id", expected: "0" }) as Box<dyn Rule>)
                     .done()
                 .build()
                 .unwrap(),
@@ -486,10 +482,10 @@ fn bench_child_aggregate(c: &mut Criterion) {
         let tree = Arc::new(
             TreeBuilder::new("root")
                 .streaming()
-                .rule(Box::new(ChildAggregateRule))
+                .rule(Box::new(ChildAggregateRule) as Box<dyn Rule>)
                 .node("item")
                     .streaming()
-                    .rule(Box::new(NoopRule))
+                    .rule(Box::new(NoopRule) as Box<dyn Rule>)
                     .done()
                 .build()
                 .unwrap(),
@@ -528,10 +524,10 @@ fn bench_parallel_files(c: &mut Criterion) {
         let tree = Arc::new(
             TreeBuilder::new("root")
                 .streaming()
-                .rule(Box::new(CheckAttrRule { attr: "version", expected: "1" }))
+                .rule(Box::new(CheckAttrRule { attr: "version", expected: "1" }) as Box<dyn Rule>)
                 .node("item")
                     .streaming()
-                    .rule(Box::new(CheckAttrRule { attr: "status", expected: "active" }))
+                    .rule(Box::new(CheckAttrRule { attr: "status", expected: "active" }) as Box<dyn Rule>)
                     .done()
                 .build()
                 .unwrap(),
@@ -544,7 +540,7 @@ fn bench_parallel_files(c: &mut Criterion) {
             |b, (xml, tree)| {
                 b.iter(|| {
                     let (tx, rx) = bounded(65536);
-                    let files: Vec<FileInfo> = (0..file_count)
+                    let files: Vec<FileInfo<Box<dyn Rule>>> = (0..file_count)
                         .map(|i| {
                             let xml = xml.clone();
                             make_file(&format!("file_{}.xml", i), tree, xml)
@@ -570,10 +566,10 @@ fn bench_parallel_scaling(c: &mut Criterion) {
     let tree = Arc::new(
         TreeBuilder::new("root")
             .streaming()
-            .rule(Box::new(CheckAttrRule { attr: "version", expected: "1" }))
+            .rule(Box::new(CheckAttrRule { attr: "version", expected: "1" }) as Box<dyn Rule>)
             .node("item")
                 .streaming()
-                .rule(Box::new(HeavyAttrRule))
+                .rule(Box::new(HeavyAttrRule) as Box<dyn Rule>)
                 .done()
             .build()
             .unwrap(),
@@ -592,7 +588,7 @@ fn bench_parallel_scaling(c: &mut Criterion) {
                         thread_count: Some(threads),
                         ..PipelineConfig::default()
                     };
-                    let files: Vec<FileInfo> = (0..file_count)
+                    let files: Vec<FileInfo<Box<dyn Rule>>> = (0..file_count)
                         .map(|i| {
                             let xml = xml.clone();
                             make_file(&format!("file_{}.xml", i), tree, xml)
@@ -619,7 +615,7 @@ fn bench_streaming_pipeline(c: &mut Criterion) {
             .streaming()
             .node("item")
                 .streaming()
-                .rule(Box::new(CheckAttrRule { attr: "status", expected: "active" }))
+                .rule(Box::new(CheckAttrRule { attr: "status", expected: "active" }) as Box<dyn Rule>)
                 .done()
             .build()
             .unwrap(),
@@ -671,7 +667,7 @@ fn bench_large_single_file(c: &mut Criterion) {
             .streaming()
             .node("item")
                 .streaming()
-                .rule(Box::new(CheckAttrRule { attr: "status", expected: "active" }))
+                .rule(Box::new(CheckAttrRule { attr: "status", expected: "active" }) as Box<dyn Rule>)
                 .done()
             .build()
             .unwrap(),
@@ -707,12 +703,12 @@ fn bench_capture_large_subtree(c: &mut Criterion) {
                 .streaming()
                 .node("schema")
                     .capture_subtree()
-                    .rule(Box::new(SubtreeCountRule { tag: "field" }))
-                    .rule(Box::new(SubtreeDeepTraversal))
+                    .rule(Box::new(SubtreeCountRule { tag: "field" }) as Box<dyn Rule>)
+                    .rule(Box::new(SubtreeDeepTraversal) as Box<dyn Rule>)
                     .done()
                 .node("entry")
                     .streaming()
-                    .rule(Box::new(NoopRule))
+                    .rule(Box::new(NoopRule) as Box<dyn Rule>)
                     .done()
                 .build()
                 .unwrap(),
