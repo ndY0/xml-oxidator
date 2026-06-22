@@ -51,7 +51,7 @@ struct SenderContext {
 
 #[derive(Debug)]
 struct CurrentViewContext {
-    pub view: Arc<Mutex<FullNodeView>>,
+    // pub view: Arc<Mutex<FullNodeView>>,
     pub text_sender: BroadcastSender<String>,
     pub children_sender: HashMap<Vec<Path>, BroadcastSender<PartialNodeView>>
 }
@@ -90,21 +90,15 @@ impl <'a> ReaderContext<'a> {
             },
             None => false
         };
-        match maybe_child {
-            Some(child) => {
-                self.current_descriptor = child;
-            },
-            None => {}
+        if let Some(child) = maybe_child {
+            self.current_descriptor = child;
         };
         matched
     }
 
     pub fn set_parent_swap_descriptor(&mut self, tree: &'a Tree) {
-        match tree.parent(self.current_descriptor) {
-            Some(parent) => {
-                self.current_descriptor = parent;
-            },
-            None => {}
+        if let Some(parent) = tree.parent(self.current_descriptor) {
+            self.current_descriptor = parent;
         }
     }
 
@@ -112,24 +106,21 @@ impl <'a> ReaderContext<'a> {
         let root_node = tree.get_root();
         let mut current_path: Vec<Path> = Vec::new();
         let mut missed_paths: Vec<Vec<Path>> = Vec::new();
-        match root_node {
-            None => {None},
-            Some(node) => {
-                current_path.push(node.path().clone());
-                // if we miss the root node, then we can return early 
-                if !self.element_senders.contains_key(&current_path) {
-                    missed_paths.push(current_path.clone());
-                    return Some(missed_paths);
-                }
-                self.collect_missing_path_children(
-                    &mut missed_paths,
-                    &mut current_path,
-                    tree,
-                    &tree.children(node)
-                );
-                Some(missed_paths)
+        root_node.and_then(|node| {
+            current_path.push(node.path().clone());
+            // if we miss the root node, then we can return early 
+            if !self.element_senders.contains_key(&current_path) {
+                missed_paths.push(current_path.clone());
+                return Some(missed_paths);
             }
-        }
+            self.collect_missing_path_children(
+                &mut missed_paths,
+                &mut current_path,
+                tree,
+                &tree.children(node)
+            );
+            Some(missed_paths)
+        })
     }
 
     fn collect_missing_path_children(
@@ -200,7 +191,7 @@ where
     S: AsyncRead + Unpin,
 {
     let workload_counter_seq = Arc::new(AtomicU8::new(0));
-    let reader_context: Mutex<ReaderContext> = Mutex::new(ReaderContext::new(descriptors.get_root().ok_or(FileReaderError("empty descriptors".into()))?));
+    let mut reader_context: ReaderContext = ReaderContext::new(descriptors.get_root().ok_or(FileReaderError("empty descriptors".into()))?);
     let reader = BufReader::new(src);
     let mut reader = Reader::from_reader(reader);
     let mut read_buf = Vec::new();
@@ -215,8 +206,7 @@ where
             event = reader.read_event_into_async(&mut read_buf) => {
                 match event {
                     Ok(mut event) => {
-                        let mut reader_context =  reader_context.lock().await;
-                        let should_abort = handle_reader_event(
+                        if handle_reader_event(
                             &mut reader_context,
                             &mut event,
                             file_id,
@@ -227,23 +217,16 @@ where
                             workload_counter_seq.clone(),
                             fatal_error_handle.clone(),
                             highwatermark
-                        ).await;
-                        if should_abort {
+                        ).await {
                             break;
                         }
-                        match &event {
-                            Event::Eof => {
-                                break;
-                            }
-                            _ => {}
+                        if let Event::Eof = &event {
+                            break;
                         }
                     },
                     Err(err) => {
-                        match collector_sender.send(FileResult::Aborted(file_id, format!("error reading xml : {:?}", err), file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
-                            Ok(()) => {},
-                            Err(err) => {
-                                fatal_error_handle.trigger_fatal(err.into()).await;
-                            }
+                        if let Err(err) = collector_sender.send(FileResult::Aborted(file_id, format!("error reading xml : {:?}", err), file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
+                            fatal_error_handle.trigger_fatal(err.into()).await;
                         };
                     }
                 }
@@ -356,39 +339,29 @@ async fn handle_reader_event<'a, 'b>(
             let length = reader_context.current_view.len();
             let view_context = &mut reader_context.current_view[length - 1];
              if let Err(err) = view_context.text_sender.send(String::from_utf8_lossy(&text.clone().into_inner()).trim().into()) {
-                match collector_sender.send(FileResult::Aborted(
+                if let Err(err) =  collector_sender.send(FileResult::Aborted(
                     file_id,
                     format!("error sending node view text : {:?}", err),
                     file.into(),
                     workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1
                 )).await {
-                    Ok(()) => {
-                        return true;
-                    },
-                    Err(err) => {
-                        fatal_error_handle.trigger_fatal(err.into()).await;
-                    }
-                };
+                    fatal_error_handle.trigger_fatal(err.into()).await;
+                }
+                return true;
              }
         },
         Event::Eof => {
             match reader_context.missed_test_paths(descriptors) {
                 Some(missed_paths) => {
                     // if we are missing some paths, we need to terminate on error
-                    match collector_sender.send(FileResult::Missed(file_id, missed_paths, file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
-                        Ok(_) => {},
-                        Err(err) => {
-                            fatal_error_handle.trigger_fatal(err.into()).await;
-                        }
+                    if let Err(err) = collector_sender.send(FileResult::Missed(file_id, missed_paths, file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
+                        fatal_error_handle.trigger_fatal(err.into()).await;
                     };
                 },
                 None => {
                     // we need to send the termination of file to the collector so that it can emit the diagnostic
-                    match collector_sender.send(FileResult::Terminated(file_id, file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
-                        Ok(_) => {},
-                        Err(err) => {
-                            fatal_error_handle.trigger_fatal(err.into()).await;
-                        }
+                    if let Err(err) = collector_sender.send(FileResult::Terminated(file_id, file.into(), workload_counter_seq.load(std::sync::atomic::Ordering::Relaxed) - 1)).await {
+                        fatal_error_handle.trigger_fatal(err.into()).await;
                     };
                 }
             }
@@ -439,11 +412,8 @@ async fn handle_path_match<'a, 'b>(
     } else {
         // if there is already one, it's a new element of a stream, we need to
         // increment the current index
-        match reader_context.element_senders.get_mut(&reader_context.current_path) {
-            Some(SenderContext { sender: _, path_index }) => {
-                *path_index += 1
-            },
-            None => {}
+        if let Some(SenderContext { sender: _, path_index }) = reader_context.element_senders.get_mut(&reader_context.current_path) {
+            *path_index += 1
         };
     }
     // in case the element contains a text content,
@@ -457,11 +427,15 @@ async fn handle_path_match<'a, 'b>(
             );
         };
     }
+    
     match reader_context.element_senders.get(&reader_context.current_path) {
         Some(SenderContext { sender, path_index }) => {
             let (text_sender, text_receiver) = broadcast::channel(highwatermark);
-            let text_receiver = Arc::new(text_receiver);
-            let (sender_stack, receiver_stack): (Vec<(Vec<Path>, BroadcastSender<PartialNodeView>)>, Vec<(Vec<Path>, BroadcastReceiver<PartialNodeView>)>) = reader_context.current_descriptor.map_children().iter()
+            let text_receiver = text_receiver;
+            let (sender_stack, receiver_stack): (
+                Vec<(Vec<Path>, BroadcastSender<PartialNodeView>)>,
+                Vec<(Vec<Path>, BroadcastReceiver<PartialNodeView>)>
+            ) = reader_context.current_descriptor.map_children().unwrap_or(&Vec::new()).iter()
             .map(|child| {
                 let (tx, rx) = broadcast::channel::<PartialNodeView>(highwatermark);
                 ((child.clone(), tx), (child.clone(), rx))
@@ -471,7 +445,7 @@ async fn handle_path_match<'a, 'b>(
                 attrs.clone(),
                 path_index.into(),
                 text_receiver,
-                Arc::new(HashMap::from_iter(receiver_stack))
+                HashMap::from_iter(receiver_stack)
             );
             let inner_view_index = inner_view.index();
             let view = Arc::new(
@@ -493,18 +467,29 @@ async fn handle_path_match<'a, 'b>(
                     partial_view
                 );
             }
+            // TODO : check if any stacked current_view need this view
+            let current_path = &reader_context.current_path;
+            let children_sender_results= reader_context.current_view.iter()
+            .flat_map(|view_context| view_context.children_sender.iter())
+            .filter(|(desired_path, _children_sender)| current_path.eq(*desired_path))
+            .map(|(_desired_path, children_sender)| children_sender.send(PartialNodeView::new(
+                attrs.clone(),
+                inner_view_index,
+                Arc::new(text_sender.subscribe())
+            )));
+            for children_sender_result in children_sender_results {
+                    if let Err(err) = children_sender_result {
+                        println!("determine what to do when the inner children dependency sending fails : {:?}", err);
+                    }
+            }
+            
             // push it to stack
             reader_context.current_view.push(
                 CurrentViewContext {
-                    view: view.clone(),
                     text_sender: text_sender,
                     children_sender: HashMap::from_iter(sender_stack)
                 }
             );
-            // TODO : check if any staked current_view need this view
-            // use the partial_view above
-
-
             
             // send it for processing
             if let Err(err) = sender.send(view).await {
@@ -524,7 +509,7 @@ async fn handle_path_match<'a, 'b>(
             }
         },
         None => {
-            // reader_context.current_view.push(NodeView::new(attrs, 0));
+            // cannot happen, since we check synchronously for existance a few lines above
         }
     }
     false

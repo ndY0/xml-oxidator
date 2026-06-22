@@ -1,5 +1,6 @@
-use std::{collections::HashMap, fmt::Display, sync::{Arc, atomic::AtomicU64}};
+use std::{fmt::Display, sync::{Arc, atomic::AtomicU64}};
 
+use futures::future::join_all;
 use tokio::{spawn, sync::mpsc::{self, Receiver, Sender, error::SendError}, task::JoinHandle};
 
 use crate::{cancellation::ShutdownHandle, filereader::XmlWorkload, init::FatalError, rulebuilder::{Path, RuleResult}};
@@ -46,7 +47,7 @@ impl <T> From<SendError<T>> for FatalError {
 
 pub async fn consume_xml_workload(
     workload_receiver: &mut Receiver<XmlWorkload>,
-    collector_sender: Arc<Sender<FileResult>>,
+    collector_sender: Sender<FileResult>,
     fatal_error_handle: ShutdownHandle<FatalError>,
     view_queue_size: usize,
 ) -> Result<(), ConsumerError> {
@@ -105,17 +106,14 @@ pub async fn consume_xml_workload(
                             ".into())).await;
                             break;
                         }
-                        match consume_payload(
+                        if let Err(err) = consume_payload(
                             &task_sender,
                             payload,
-                            Arc::clone(&collector_sender),
+                            &collector_sender,
                             Arc::clone(&payloads_count),
                             workload_fatal_error_handle.clone()
                         ).await {
-                            Ok(()) => {},
-                            Err(err) => {
-                                workload_fatal_error_handle.trigger_fatal(err.into()).await;
-                            }
+                            workload_fatal_error_handle.trigger_fatal(err.into()).await;
                         }
                     },
                     None => {
@@ -131,19 +129,18 @@ pub async fn consume_xml_workload(
 async fn consume_payload(
     task_sender: &Sender<JoinHandle<()>>, 
     mut payload: XmlWorkload,
-    collector_sender: Arc<Sender<FileResult>>,
+    collector_sender: &Sender<FileResult>,
     payloads_count: Arc<AtomicU64>,
     workload_fatal_error_handle: ShutdownHandle<FatalError>
 ) -> Result<(), ConsumerError> {
     let cloned_collector_sender = collector_sender.clone();
     task_sender.send(
         spawn(async move {
-            let ctx = HashMap::new();
             while let Some(view) = payload.events.recv().await {
-                for rule in payload.rules.iter_mut() {
-                    // TODO : since this is async code now, run it in //
-                    rule.fold(&view, &ctx).await;
-                }
+                join_all(
+                    payload.rules.iter_mut()
+                    .map(|rule| rule.fold(view.clone(), payload.ctx.clone()))
+                ).await;
             }
             let results: Vec<RuleResult> = payload.rules.iter()
             .map(|rule| {
@@ -155,11 +152,8 @@ async fn consume_payload(
                     diagnostic.assertion
                 )
             }).collect();
-            match cloned_collector_sender.send(FileResult::Progress(payload.file_id, payload.file, payload.workload_counter, results)).await {
-                Ok(()) => {},
-                Err(err) => {
-                    workload_fatal_error_handle.trigger_fatal(err.into()).await;
-                }
+            if let Err(err) = cloned_collector_sender.send(FileResult::Progress(payload.file_id, payload.file, payload.workload_counter, results)).await {
+                workload_fatal_error_handle.trigger_fatal(err.into()).await;
             };
         })
     ).await?;

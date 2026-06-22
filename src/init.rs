@@ -129,16 +129,13 @@ where
     .map(|(mut rx, sender)| {
         let cloned_fatal_error_handle = fatal_error_handle.clone();
         spawn( async move {
-            match consume_xml_workload(
+            if let Err(err) = consume_xml_workload(
                 &mut rx,
-                Arc::new(sender),
+                sender,
                 cloned_fatal_error_handle,
                 view_queue_size
             ).await {
-                Ok(()) => {},
-                Err(err) => {
-                    println!("an error occured : {:?}", err)
-                }
+                println!("an error occured : {:?}", err)
             }
         })
     }).collect();
@@ -162,15 +159,14 @@ where
                     }
                     mut item = rx.lock() => {
                         let item = item.recv().await;
-                        match sender_loop.next() {
-                            Some(current_sender) => {
-                                match item {
-                                    Some(FileInfo {
-                                        filename,
-                                        descriptors,
-                                        stream_factory
-                                    }) => {
-                                        match read(
+                        if let Some(current_sender) = sender_loop.next() {
+                            match item {
+                                Some(FileInfo {
+                                    filename,
+                                    descriptors,
+                                    stream_factory
+                                }) => {
+                                    if let Err(err) = read(
                                         cloned_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
                                         &filename,
                                         stream_factory(),
@@ -180,14 +176,11 @@ where
                                         view_queue_size,
                                         cloned_fatal_error_handle.clone()
                                     ).await {
-                                        Ok(()) => {},
-                                            Err(err) => { println!("an error occured : {:?}", err) } 
-                                        }
-                                    },
-                                    None => break,
-                                }
-                            },
-                            None => {}
+                                        println!("an error occured : {:?}", err)
+                                    }
+                                },
+                                None => break,
+                            }
                         }
                     }
             

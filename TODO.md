@@ -47,6 +47,8 @@
         - adapt rule builder to allow to bind a node partial view to the context
         - finish implementing the context consumption properly
 
+    DONE
+
 # Implement a check for unused declared rules that should trigger an error
 
     DONE : implementation backed by the sender hashmap comparaison against the rule tree

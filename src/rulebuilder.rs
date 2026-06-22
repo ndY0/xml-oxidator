@@ -23,14 +23,14 @@ pub trait NodeBuilder {
     type PathOutput;
     type BuildOutput;
     fn add_rule(self, rule: Box<dyn Rule>) -> Self::AddRuleOutput;
-    fn path(self, path: Path, map_view: bool, map_children: Vec<Vec<Path>>) -> Self::PathOutput;
+    fn path(self, path: Path, map_view: bool, map_children: Option<Vec<Vec<Path>>>) -> Self::PathOutput;
     fn build(self) -> Self::BuildOutput;
 }
 
 pub trait Rule
     where Self: Sync + Send + DynCloneRule + Debug
 {
-    fn fold(&mut self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + '_>>;
+    fn fold(&mut self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<Mutex<HashMap<Vec<Path>, PartialNodeView>>>) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + '_>>;
     fn assert(&self, path: &str) -> Diagnostic;
 }
 
@@ -61,7 +61,7 @@ pub struct Root<State> {
     tree: Rc<RefCell<Tree>>,
     path: Path,
     map_view: bool,
-    map_children: Vec<Vec<Path>>,
+    map_children: Option<Vec<Vec<Path>>>,
     nodes: HashMap<Path, usize>,
     rules: Vec<Box<dyn Rule>>
 }
@@ -96,7 +96,7 @@ impl NodeBuilder for Root<InitState> {
         self
     }
 
-    fn path(self, path: Path, map_view: bool, map_children: Vec<Vec<Path>>) -> Self::PathOutput {
+    fn path(self, path: Path, map_view: bool, map_children: Option<Vec<Vec<Path>>>) -> Self::PathOutput {
         let build_parent: Root<NodeAdderState> = Root {
             _state: std::marker::PhantomData,
             tree: Rc::clone(&self.tree),
@@ -139,7 +139,7 @@ impl NodeBuilder for Root<InitState> {
 }
 
 impl Root<InitState> {
-    pub fn new(root: &str, map_view: bool, map_children: Vec<Vec<Path>>) -> Self {
+    pub fn new(root: &str, map_view: bool, map_children: Option<Vec<Vec<Path>>>) -> Self {
         Self {
             _state: std::marker::PhantomData,
             tree: Rc::new(RefCell::new(Tree::new())),
@@ -156,7 +156,7 @@ pub struct Child<State, Parent> {
     _state: std::marker::PhantomData<State>,
     tree: Rc<RefCell<Tree>>,
     map_view: bool,
-    map_children: Vec<Vec<Path>>,
+    map_children: Option<Vec<Vec<Path>>>,
     parent: Parent,
     path: Path,
     nodes: HashMap<Path, usize>,
@@ -197,7 +197,7 @@ impl <P: NodeHandler> NodeBuilder for Child<InitState, P> {
         self
     }
 
-    fn path(self, path: Path, map_view: bool, map_children: Vec<Vec<Path>>) -> Self::PathOutput
+    fn path(self, path: Path, map_view: bool, map_children: Option<Vec<Vec<Path>>>) -> Self::PathOutput
         where Child<NodeAdderState, P>: NodeHandler
     {
         let build_parent = Child {
@@ -242,7 +242,7 @@ impl <P: NodeHandler> Child<InitState, P> {
         tree: Rc<RefCell<Tree>>,
         path: Path,
         map_view: bool,
-        map_children: Vec<Vec<Path>>
+        map_children: Option<Vec<Vec<Path>>>
     ) -> Child<InitState, P> {
         Child {
             _state: std::marker::PhantomData,
@@ -309,7 +309,7 @@ pub struct Node {
     path: Path,
     rules: Vec<Box<dyn Rule>>,
     map_view: bool,
-    map_children: Vec<Vec<Path>>,
+    map_children: Option<Vec<Vec<Path>>>,
     nodes: HashMap<Path, usize>,
     parent: Option<usize>
 
@@ -320,7 +320,7 @@ impl Node {
         path: Path,
         rules: Vec<Box<dyn Rule>>,
         map_view: bool,
-        map_children: Vec<Vec<Path>>
+        map_children: Option<Vec<Vec<Path>>>
     ) -> Self {
         Self {
             path,
@@ -345,8 +345,8 @@ impl Node {
         self.map_view
     }
 
-    pub fn map_children(&self) -> &Vec<Vec<Path>> {
-        &self.map_children
+    pub fn map_children(&self) -> Option<&Vec<Vec<Path>>> {
+        self.map_children.as_ref()
     }
 
     pub fn path(&self) -> &Path {
@@ -366,18 +366,16 @@ pub struct NoFold;
 pub struct NoInit;
 pub struct NoAssert;
 
-type AsyncTestFn<R> = Arc<dyn Fn(Arc<Mutex<FullNodeView>>, Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = R> + Send + Sync>> + Send + Sync>;
-
 pub trait AsyncTest<R> {
-    fn call(& self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = R> + Send + Sync + 'static>>;
+    fn call(&self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<Mutex<HashMap<Vec<Path>, PartialNodeView>>>) -> Pin<Box<dyn Future<Output = R> + Send + Sync + 'static>>;
 }
 
-impl <'a, R, F, Fut> AsyncTest<R> for F
+impl <R, F, Fut> AsyncTest<R> for F
 where
-    F: Fn(Arc<Mutex<FullNodeView>>, Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Fut + Send + Sync,
+    F: Fn(Arc<Mutex<FullNodeView>>, Arc<Mutex<HashMap<Vec<Path>, PartialNodeView>>>) -> Fut + Send + Sync,
     Fut: Future<Output = R> + Send + Sync + 'static
 {
-    fn call(&self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = R> + Send + Sync + 'static>> {
+    fn call(&self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<Mutex<HashMap<Vec<Path>, PartialNodeView>>>) -> Pin<Box<dyn Future<Output = R> + Send + Sync + 'static>> {
         Box::pin(self(view, ctx))
     }
 }
@@ -400,15 +398,20 @@ impl <'a> RuleBuilder<
     NoInit,
     NoAssert,
 > {
-    pub fn test<R>(name: String, test: Arc<dyn AsyncTest<R> + Sync + Send>) -> RuleBuilder<
+    pub fn test<R, F, Fut>(name: String, test: F)
+    -> RuleBuilder<
         Arc<dyn AsyncTest<R> + Sync + Send>,
         NoFold,
         NoInit,
         NoAssert,
-    > { 
+    >
+    where
+        F: Fn(Arc<Mutex<FullNodeView>>, Arc<Mutex<HashMap<Vec<Path>, PartialNodeView>>>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = R> + Send + Sync + 'static
+    { 
         RuleBuilder {
             name,
-            test: test,
+            test: Arc::new(test),
             fold: NoFold,
             init: NoInit,
             assert: NoAssert,
@@ -425,16 +428,19 @@ impl <R> RuleBuilder<
 where
     R: Clone + 'static
 {
-    pub fn fold<Acc: Send + 'static>(self, fold: Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>) -> RuleBuilder<
+    pub fn fold<Acc: Send + 'static, F>(self, fold: F) -> RuleBuilder<
         Arc<dyn AsyncTest<R> + Sync + Send>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
         NoInit,
         NoAssert,
-    > {
+    >
+    where
+        F: Fn(&Acc, R) -> Acc + Send + Sync + 'static
+    {
         RuleBuilder {
             name: self.name,
             test: self.test,
-            fold: fold,
+            fold: Arc::new(fold),
             init: NoInit,
             assert: NoAssert,
         }
@@ -451,17 +457,20 @@ where
     Acc: Send + Clone + 'static,
     R: Clone + 'static
 {
-    pub fn init(self, init: Box<dyn Fn() -> Acc>) -> RuleBuilder<
+    pub fn init<F>(self, init: F) -> RuleBuilder<
         Arc<dyn AsyncTest<R> + Sync + Send>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
         Box<dyn Fn() -> Acc>,
         NoAssert,
-    > {
+    >
+    where
+        F: Fn() -> Acc + 'static
+    {
         RuleBuilder {
             name: self.name,
             test: self.test,
             fold: self.fold,
-            init: init,
+            init: Box::new(init),
             assert: NoAssert,
         }
     }
@@ -477,18 +486,21 @@ where
     Acc: Send + Clone + 'static,
     R: Clone + 'static
 {
-    pub fn assert(self, assert: Arc<dyn Fn(&Acc) -> bool + Send + Sync>) -> RuleBuilder<
+    pub fn assert<F>(self, assert: F) -> RuleBuilder<
         Arc<dyn AsyncTest<R> + Sync + Send>,
         Arc<dyn Fn(&Acc, R) -> Acc + Send + Sync>,
         Box<dyn Fn() -> Acc>,
         Arc<dyn Fn(&Acc) -> bool + Send + Sync>,
-    > {
+    >
+    where
+        F: Fn(&Acc) -> bool + Send + Sync + 'static
+    {
         RuleBuilder {
             name: self.name,
             test: self.test,
             fold: self.fold,
             init: self.init,
-            assert: assert,
+            assert: Arc::new(assert),
         }
     }
 }
@@ -556,7 +568,7 @@ impl <Acc, R> Rule for ConcreteRule<Acc, R>
         Acc: Debug + Sync + Send + Clone + 'static,
         R: Clone + 'static
 {
-    fn fold(&mut self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<HashMap<Vec<Path>, Mutex<PartialNodeView>>>) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + '_>> {
+    fn fold(&mut self, view: Arc<Mutex<FullNodeView>>, ctx: Arc<Mutex<HashMap<Vec<Path>, PartialNodeView>>>) -> Pin<Box<dyn Future<Output = ()> + Send + Sync + '_>> {
         Box::pin(async move {
             self.state = (self.fold)(&self.state, self.test.call(view, ctx).await);
         })
@@ -578,7 +590,7 @@ pub struct Diagnostic {
 }
 
 pub trait CommonNodeView {
-    fn text(&self) -> Arc<Receiver<String>>;
+    fn text(&self) -> &Receiver<String>;
     fn attr(&self, key: &str) -> Option<&String>;
     fn index(&self) -> usize;
 }
@@ -586,17 +598,17 @@ pub trait CommonNodeView {
 #[derive(Debug)]
 pub struct FullNodeView {
     index: usize,
-    text: Arc<Receiver<String>>,
+    text: Receiver<String>,
     attrs: HashMap<String, String>,
-    children: Arc<HashMap<Vec<Path>, Receiver<PartialNodeView>>>
+    children: HashMap<Vec<Path>, Receiver<PartialNodeView>>
 }
 
 impl FullNodeView {
     pub fn new(
         attrs: HashMap<String, String>,
         index: usize,
-        receiver: Arc<Receiver<String>>,
-        children: Arc<HashMap<Vec<Path>, Receiver<PartialNodeView>>>
+        receiver: Receiver<String>,
+        children: HashMap<Vec<Path>, Receiver<PartialNodeView>>
     ) -> Self {
         Self {
             index,
@@ -606,14 +618,14 @@ impl FullNodeView {
         }
     }
 
-    pub fn children(&self) -> Arc<HashMap<Vec<Path>, Receiver<PartialNodeView>>> {
-        self.children.clone()
+    pub fn children(&mut self) -> &mut HashMap<Vec<Path>, Receiver<PartialNodeView>> {
+        &mut self.children
     }
 }
 
 impl CommonNodeView for FullNodeView {
-    fn text(&self) -> Arc<Receiver<String>> {
-        self.text.clone()
+    fn text(&self) -> &Receiver<String> {
+        &self.text
     }
 
     fn attr(&self, key: &str) -> Option<&String> {
@@ -643,9 +655,9 @@ impl PartialNodeView {
     }
 }
 
-impl <'a> CommonNodeView for PartialNodeView {
-    fn text(&self) -> Arc<Receiver<String>> {
-        self.text.clone()
+impl CommonNodeView for PartialNodeView {
+    fn text(&self) -> &Receiver<String> {
+        &self.text
     }
 
     fn attr(&self, key: &str) -> Option<&String> {
@@ -660,9 +672,9 @@ impl <'a> CommonNodeView for PartialNodeView {
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 pub struct Path(pub String);
 
-impl ToString for Path {
-    fn to_string(&self) -> String {
-        self.0.clone()
+impl Display for Path {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

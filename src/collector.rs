@@ -1,5 +1,5 @@
 use std::{collections::HashMap, error::Error, fmt::Display};
-use tokio::sync::{Mutex, mpsc::{Receiver, Sender, error::SendError}};
+use tokio::sync::mpsc::{Receiver, Sender, error::SendError};
 
 use crate::{cancellation::ShutdownHandle, init::FatalError, rulebuilder::RuleResult, xmlworker::FileResult};
 
@@ -63,7 +63,7 @@ pub async fn collect_results(
     diagnostic_sender: &Sender<FullDiagnostic>,
     fatal_error_handle: ShutdownHandle<FatalError>
 ) -> () {
-    let results: Mutex<HashMap<u64, (String, Option<u8>, Vec<u8>, Vec<RuleResult>)>> = Mutex::new(HashMap::new());
+    let mut results: HashMap<u64, (String, Option<u8>, Vec<u8>, Vec<RuleResult>)> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -74,7 +74,6 @@ pub async fn collect_results(
             file_result = collector_receiver.recv() => {
                 match file_result {
                     Some(file_result) => {
-                        let mut results = results.lock().await;
                         match process_file_result(
                             &mut results,
                             file_result,
